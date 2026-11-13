@@ -141,7 +141,10 @@ Always-read signals: operands of `$past` / `$rose` / `$fell` / `$stable` /
 largest `$past` depth. `disable iff` operands are read only when the assertion
 is not idle.
 
-### 5.5 Idle sleep (phase 3)
+### 5.5 Idle sleep (phase 2)
+
+Phase 0 showed the per-cycle Python wake (3–7 µs) is the dominant fixed cost
+once the engine itself is fast, so this moved forward from phase 3.
 
 When every assertion on a clocking event is idle, stop awaiting the clock and
 await value changes of the signals the idle states depend on (plus history
@@ -152,16 +155,18 @@ valid. Enabled only after the reference-model fuzzing (§10) passes on it.
 
 SVA samples values in the Preponed region — before the clock edge's updates.
 
-- **Clock driven from cocotb** (`cocotb.clock.Clock`, including the GPI clock):
-  the edge callback runs before the design reacts to the edge on all supported
-  simulators, so reads return pre-edge values — correct SVA sampling.
-  `EdgeSampler` is supported for this case.
-- **Clock generated or derived inside the HDL**: on Verilator the callback runs
-  after the evaluation step (post-edge values); on event-driven simulators a
-  delta-cycle race can partly expose updated values. The package detects this
-  case and warns; correct support arrives with `PreponedSampler` (phase 4).
+Measured in phase 0 on every simulator (see `phase0-results.md` §1):
 
-Phase 0 verifies these statements with a calibration test on every simulator.
+- **Clock driven from cocotb** (`cocotb.clock.Clock`, GPI or Python
+  implementation): reads at the edge callback return pre-edge values on every
+  simulator — correct SVA sampling. `EdgeSampler` is supported for this case.
+- **Clock derived inside the HDL** (e.g. a divided clock): signals of the
+  source domain read post-edge on **every** simulator (delta-cycle / NBA race),
+  so `EdgeSampler` is wrong there regardless of simulator.
+- **Clock generated inside the HDL** (`after` / `#` delays): correct on
+  event-driven simulators, post-edge on Verilator (callbacks run after `eval()`).
+- The package detects assertions clocked by a signal not driven from cocotb
+  and warns; correct support arrives with `PreponedSampler` (phase 4).
 
 X/Z handling: by default an unknown value in a boolean condition is false (like
 an `if`). A strict mode treats unknown in a condition as a failure.
@@ -278,15 +283,25 @@ trace and added to the regression suite.
 | Tier | Technique | Phase |
 |---|---|---|
 | 1 | One sampling loop per clocking event; lazy DFA; each signal read at most once per cycle; demand-driven reads | 1 |
-| 2 | Fast read path: avoid building `LogicArray` objects; integer reads by default, string reads only when X detection is needed. Private cocotb API isolated in one adapter module with a public-API fallback | 1 |
-| 3 | Idle sleep | 3 |
+| 2 | Fast read path: low-level GPI reads instead of `.value` (5–10× cheaper for narrow signals). Reader chosen per (GPI interface, object type) from a calibrated table, never by probing a live value: VPI ≤ 32 bits → GPI long (masked to unsigned); VHPI any width and anything > 32 bits → GPI binary string. Private cocotb API isolated in one adapter module with a public-API fallback and a per-simulator self-test in CI | 1 |
+| 3 | Idle sleep | 2 |
 | 4 | Optional compiled kernel (Rust/PyO3, abi3 wheels) with pure-Python fallback — only if benchmarks show the Python loop dominates | 3 |
 | 5 | `TraceSampler` offline mode on FST/VCD dumps (zero simulation overhead) | 3 |
 | 6 | `ProbeSampler`: generated HDL wrapper (VHDL-2008 external names / Verilog hierarchical references), one packed read per cycle, optional HDL-side batching (reports delayed by ≤ N cycles, failure time still exact) | 4 |
 
-Phase 0 benchmarks set concrete targets (e.g. "≤ 1.3× slowdown with 100
-assertions on nvc") against a no-assertion baseline and a naive
-coroutine-per-attempt implementation.
+Targets are absolute overhead per simulated cycle, because slowdown ratios
+depend on DUT size (phase 0 results §3):
+
+| Item | Target |
+|---|---|
+| Wake per clocking event per cycle | the GPI floor |
+| Fast-path assertion, active, per cycle (pure Python) | ≤ 0.3 µs |
+| Fast-path assertion, idle, per cycle | ≤ 0.1 µs |
+| All assertions idle, with idle sleep | no per-cycle wake |
+| Optional compiled kernel, per assertion per cycle | ≤ 0.05 µs |
+
+For reference, a coroutine-per-attempt implementation measured ~8.6 µs per
+assertion per cycle.
 
 ## 12. Packaging and development
 
@@ -299,9 +314,7 @@ coroutine-per-attempt implementation.
 
 ## 13. Phases
 
-0. **Calibration and benchmarks** on every simulator: sampling behavior
-   (cocotb-driven vs. HDL clocks), read cost (public vs. low-level API),
-   baseline speed, naive-implementation cost, golden-corpus output format.
+0. **Calibration and benchmarks** — done, see `phase0-results.md`.
 1. **Core:** parser + IR, NFA + lazy DFA, `EdgeSampler` with demand-driven
    reads, immediate + deferred assertions, sampled-value functions, all
    sequence operators, implications, `disable iff`, clocking events with `iff`,
@@ -309,8 +322,8 @@ coroutine-per-attempt implementation.
    golden-corpus harness.
 2. **Full property language:** `always` / `eventually` / `until` /
    `nexttime`, `accept_on` / `reject_on`, `cover`, `expect`, assertion control,
-   statistics, vacuity warnings.
-3. **Speed:** idle sleep, optional compiled kernel, offline `TraceSampler`.
+   statistics, vacuity warnings; idle sleep.
+3. **Speed:** optional compiled kernel, offline `TraceSampler`.
 4. **Clocking extensions:** `PreponedSampler`, multi-clock sequences,
    `ProbeSampler`, library of ready-made checkers.
 

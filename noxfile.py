@@ -58,6 +58,16 @@ def calibrate(session):
 
 
 @nox.session(python=False)
+def bench(session):
+    """Phase 0: read cost and simulation speed under Python load."""
+    out = "benchmarks/results.jsonl"
+    if os.path.exists(out):
+        os.remove(out)
+    _run_everywhere(session, "benchmarks/run.py")
+    session.run(sys.executable, "benchmarks/report.py", external=True)
+
+
+@nox.session(python=False)
 def smoke(session):
     """Minimal cocotb 2.x test on each simulator (VHDL and/or Verilog top)."""
     for sim in _selected_sims(session):
