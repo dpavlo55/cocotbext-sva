@@ -3,6 +3,7 @@ import os
 import sys
 from pathlib import Path
 
+from cocotb_tools.check_results import get_results
 from cocotb_tools.runner import get_runner
 
 here = Path(__file__).resolve().parent
@@ -15,6 +16,10 @@ if lang == "vhdl":
 
 runner = get_runner(sim)
 build_dir = here / "sim_build" / f"{sim}_{lang}"
-runner.build(sources=src, hdl_toplevel="counter", build_dir=build_dir, always=True)
-runner.test(hdl_toplevel="counter", test_module="test_counter", build_dir=build_dir)
+runner.build(sources=src, hdl_toplevel="counter", build_dir=build_dir, always=True,
+             timescale=("1ns", "1ps"))
+results = runner.test(hdl_toplevel="counter", test_module="test_counter", build_dir=build_dir)
+num_tests, num_failed = get_results(results)
+if num_tests == 0 or num_failed:
+    sys.exit(f"smoke failed on {sim}: {num_failed}/{num_tests} tests failed")
 

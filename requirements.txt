@@ -1,3 +1,4 @@
-# Development environment for cocotb-sva (pip install -r requirements.txt)
+# Development environment for cocotbext-sva (pip install -r requirements.txt)
 cocotb>=2.0,<3
 pytest
+nox
