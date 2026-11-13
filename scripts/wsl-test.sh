@@ -28,6 +28,6 @@ stamp=.venv/.requirements.sha
 if ! sha256sum -c --status "$stamp" 2>/dev/null; then
     .venv/bin/pip install -q --upgrade pip
     .venv/bin/pip install -q -r requirements.txt
-    sha256sum requirements.txt > "$stamp"
+    sha256sum requirements.txt pyproject.toml > "$stamp"
 fi
 exec .venv/bin/nox "$@"

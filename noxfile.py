@@ -68,6 +68,12 @@ def bench(session):
 
 
 @nox.session(python=False)
+def tests(session):
+    """Unit tests and differential fuzzing (no simulator)."""
+    session.run(sys.executable, "-m", "pytest", "-q", "tests", *session.posargs, external=True)
+
+
+@nox.session(python=False)
 def smoke(session):
     """Minimal cocotb 2.x test on each simulator (VHDL and/or Verilog top)."""
     for sim in _selected_sims(session):
