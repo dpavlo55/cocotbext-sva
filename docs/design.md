@@ -1,6 +1,6 @@
 # cocotbext-sva — design
 
-Status: draft, pre-implementation. This document records the design decisions
+Status: phase 1 implemented. This document records the design decisions
 made before the first line of the package was written. It is the reference for
 contributors; update it when a decision changes.
 
@@ -244,14 +244,27 @@ Named / parameterized sequences and properties; `let` as a macro.
 functions (`$past_gclk` …), recursive properties, multi-clock sequences
 (phase 4).
 
-## 9. Semantic decisions to pin down in phase 1
+## 9. Semantic decisions (settled in phase 1)
 
-- what `$past` returns before enough history exists (SV: the initial value of
-  the expression's type — X for 4-state);
-- vacuous vs. real pass classification for every operator;
-- end-of-test treatment of pending weak vs. strong obligations;
-- `cover` multiplicity under overlapping matches;
-- deferred-assertion flush points in cocotb's scheduler.
+Settled by the golden corpus (behaviour of a mature SVA implementation) where
+the LRM leaves room, otherwise by the LRM:
+
+| Topic | Decision |
+|---|---|
+| Default strength | From the directive only: weak in assert/assume, strong in cover. `not` does not change it (16.12.2) |
+| Vacuity | Property of the evaluation (16.14.8): failures can be vacuous too. `or`/`iff` decide once truth and vacuity are known; vacuity of a pending evaluation can be known early (an implication whose antecedent matched) |
+| `implies` | Vacuous when the left side is false |
+| `#-#`, `#=#` | Existential dual of implication; an antecedent that can still match at the end of the test is not a failure |
+| End of test | Pending weak obligations pass silently, strong ones fail; a `|=>` consequent that has not seen a tick is not evaluated |
+| Sequence `and` | Empty matches of an operand do not take part |
+| Contradictions | A transition whose conditions require the same expression true and false is dropped at build time (the attempt fails one tick earlier than the formal truncated-path semantics) |
+| `$past` before history | Value at the time the assertion was created (the "default sampled value") |
+| `disable iff` | Evaluated at clock ticks; disabled attempts produce no verdict |
+| `cover` | Counts nonvacuous matches; non-matching attempts are not errors |
+
+Known differences from the reference implementation are listed with reasons
+in `tests/test_corpus.py` (one is a reference-tool quirk with `if/else`; one is
+contradiction detection across different expressions).
 
 ## 10. Verification strategy
 
@@ -315,6 +328,7 @@ assertion per cycle.
 ## 13. Phases
 
 0. **Calibration and benchmarks** — done, see `phase0-results.md`.
+   Phase 1 — done, see `phase1-results.md`.
 1. **Core:** parser + IR, NFA + lazy DFA, `EdgeSampler` with demand-driven
    reads, immediate + deferred assertions, sampled-value functions, all
    sequence operators, implications, `disable iff`, clocking events with `iff`,
