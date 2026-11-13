@@ -303,3 +303,39 @@ def _time(fn):
     t0 = time.perf_counter()
     fn()
     return time.perf_counter() - t0
+
+
+async def _package(dut, k, mixed=False):
+    from cocotbext.sva import Assertions, posedge
+    stats = {}
+
+    async def body():
+        a = Assertions(dut, clock=posedge(dut.clk), name="b")
+        texts = ["req |-> ##[1:3] ack"]
+        if mixed:
+            texts = ["req |-> ##[1:3] ack", "req |=> ##1 ack", "ack |-> $past(req, 2)",
+                     "$rose(req) |-> ##2 ack", "req ##1 req |-> ##1 ack ##1 ack"]
+        for i in range(k):
+            a.assert_property(texts[i % len(texts)], name=f"p{i}")
+        await Timer(CYCLES * PERIOD_NS, unit="ns")
+        errs = a.finalize(raise_on_failure=False)
+        st = a.stats()
+        stats["passes"] = sum(v.get("passes", 0) for v in st.values())
+        stats["failures"] = len(errs)
+    label = "mixed" if mixed else "same"
+    await _timed(dut, f"5 cocotbext-sva x{k} {label}", body, stats=stats, assertions=k)
+
+
+@cocotb.test()
+async def speed_5_package_10(dut):
+    await _package(dut, 10)
+
+
+@cocotb.test()
+async def speed_5_package_50(dut):
+    await _package(dut, 50)
+
+
+@cocotb.test()
+async def speed_5_package_50_mixed(dut):
+    await _package(dut, 50, mixed=True)

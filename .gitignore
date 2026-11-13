@@ -14,3 +14,5 @@ benchmarks/results*.jsonl
 *.egg-info/
 calibration/types.jsonl
 build/
+*.out
+*.prof

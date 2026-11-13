@@ -59,8 +59,11 @@ class Monitor:
         self.name = name
         self.sink = sink              # sink(event, monitor, count, starts, tick)
         self.domain = domain
-        self.stats = Stats()
+        self.n_attempts = self.n_passes = self.n_vacuous = self.n_failures = 0
+        self.n_disabled = self.n_pending_fail = 0
         self.enabled = True           # $asserton/$assertoff: start new attempts?
+        self._start_bit = prog.start_bit
+        self._sink_vac = getattr(sink, "wants_vacuous", False)
         self.tmpl = prog.tmpl
         self._init_term = prog.tmpl.init(tuple([None] * prog.nlocals)) if prog.envmode else prog.tmpl.init(())
         self._intern: dict = {}
@@ -100,7 +103,7 @@ class Monitor:
         if bits & prog.disable_bit:
             moves = (-DISABLED,) * len(gs.terms)
             new = -DISABLED if start else None
-            tr = (self._gstate(()), moves, new)
+            tr = (self._gstate(()), moves, new) + self._plan(list(moves), new, 0)
         else:
             val = Val(bits)
             step = self.tmpl.step
@@ -119,12 +122,31 @@ class Monitor:
             for v, t2 in results:
                 moves.append(-v if v is not None else pos[t2])
             new = moves.pop() if start else None
-            tr = (self._gstate(tuple(order)), tuple(moves), new)
+            tr = (self._gstate(tuple(order)), tuple(moves), new) + self._plan(moves, new, len(order))
         self._ntrans += 1
         if self._ntrans > _CACHE_LIMIT:
             self._flush()
         gs.trans[bits] = tr
         return tr
+
+    @staticmethod
+    def _plan(moves, new, ndest):
+        """(perm, verdicts) for the fast metadata update, or (None, None) if
+        attempts merge. perm[j] = source index of destination j (-1: the new
+        attempt); verdicts = ((source index or -1, verdict), ...)."""
+        dests = [mv for mv in moves if mv >= 0] + ([new] if new is not None and new >= 0 else [])
+        if len(dests) != len(set(dests)):
+            return (None, None)
+        perm = [0] * ndest
+        for i, mv in enumerate(moves):
+            if mv >= 0:
+                perm[mv] = i
+        if new is not None and new >= 0:
+            perm[new] = -1
+        verdicts = tuple((i, -mv) for i, mv in enumerate(moves) if mv < 0)
+        if new is not None and new < 0:
+            verdicts += ((-1, -new),)
+        return (tuple(perm), verdicts)
 
     def _flush(self):
         for g in self._gstates.values():
@@ -134,16 +156,23 @@ class Monitor:
     def tick(self, c, R, cx, RX, H, tickno):
         """Evaluate one clock tick (fast path)."""
         gs = self.gs
-        bits = gs.bitsfn(c, R, cx, RX, H)
         if self.enabled:
-            bits |= self.prog.start_bit
-            self.stats.attempts += 1
+            bits = gs.bitsfn(c, R, cx, RX, H) | self._start_bit
+            self.n_attempts += 1
+        else:
+            bits = gs.bitsfn(c, R, cx, RX, H)
         tr = gs.trans.get(bits)
         if tr is None:
             tr = self._expand(gs, bits)
-        nxt, moves, new = tr
+        nxt, moves, new, perm, verdicts = tr
         self.gs = nxt
         if not moves:
+            # nothing in flight before this tick (the common, idle case)
+            if new == -2:                      # new attempt vacuous at once
+                self.n_vacuous += 1
+                if self._sink_vac:
+                    self.sink(VPASS, self, 1, ((tickno, self.domain.now()),), tickno)
+                return
             if new is None:
                 return
             if new < 0:
@@ -152,6 +181,18 @@ class Monitor:
             self.meta = [(1, ((tickno, self.domain.now()),))]
             return
         old = self.meta
+        if perm is not None:
+            for i, v in verdicts:
+                if v == 2 and i >= 0 and not self._sink_vac:
+                    self.n_vacuous += old[i][0]
+                else:
+                    self._verdict(v, old[i] if i >= 0 else None, tickno)
+            if new is not None and new >= 0:
+                nm = (1, ((tickno, self.domain.now()),))
+                self.meta = [old[i] if i >= 0 else nm for i in perm]
+            else:
+                self.meta = [old[i] for i in perm]
+            return
         meta = [None] * len(nxt.terms)
         for i, mv in enumerate(moves):
             if mv >= 0:
@@ -165,26 +206,32 @@ class Monitor:
                 self._verdict(-new, None, tickno)
         self.meta = meta
 
+    @property
+    def stats(self) -> Stats:
+        st = Stats()
+        st.attempts, st.passes, st.vacuous = self.n_attempts, self.n_passes, self.n_vacuous
+        st.failures, st.disabled, st.pending_fail = self.n_failures, self.n_disabled, self.n_pending_fail
+        return st
+
     def _verdict(self, v, meta, tickno):
-        st = self.stats
         count = meta[0] if meta else 1
         if v == VPASS:
-            st.vacuous += count
+            self.n_vacuous += count
             if self.sink.wants_vacuous:
                 self.sink(VPASS, self, count, self._starts(meta, tickno), tickno)
             return
         if v == PASS:
-            st.passes += count
+            self.n_passes += count
             if self.prog.kind == "cover" or self.sink.wants_pass:
                 self.sink(PASS, self, count, self._starts(meta, tickno), tickno)
             return
         if v == FAIL or v == VFAIL:
             if self.prog.kind == "cover":
                 return            # a cover attempt that does not match is not an error
-            st.failures += count
+            self.n_failures += count
             self.sink(FAIL, self, count, self._starts(meta, tickno), tickno)
             return
-        st.disabled += count
+        self.n_disabled += count
 
     def _starts(self, meta, tickno):
         if meta is None:
@@ -199,7 +246,7 @@ class Monitor:
         if not toks and not start:
             return
         if start:
-            self.stats.attempts += 1
+            self.n_attempts += 1
         bits = self._allbits(c, R, cx, RX, H)
         if bits & prog.disable_bit:
             for t, m in toks.items():
@@ -236,8 +283,8 @@ class Monitor:
         """End of evaluation: strong obligations still pending fail."""
         for term, meta in self.pending():
             if self.prog.kind != "cover" and not self.tmpl.finish(term):
-                self.stats.failures += meta[0]
-                self.stats.pending_fail += meta[0]
+                self.n_failures += meta[0]
+                self.n_pending_fail += meta[0]
                 self.sink(FAIL, self, meta[0], meta[1], tickno, at_end=True)
         if self.prog.envmode:
             self.tokens = {}

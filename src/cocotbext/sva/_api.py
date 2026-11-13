@@ -180,6 +180,7 @@ class _Domain:
         self.channels: list = []       # (vfn, gfn, ring)
         self.channel_of: dict = {}
         self.monitors: list = []
+        self.steps: list = []          # bound step functions of the monitors (hot loop)
         self.iff_fn = None
         self.tickno = -1
         self._now_tick = None
@@ -267,9 +268,8 @@ class _Domain:
                     if gfn is None or gfn(c, R, cx, RX, H):
                         ring.append(cur)
                 t = self.tickno
-                for m in self.monitors:
-                    if m.enabled_any:
-                        m.step(c, R, cx, RX, H, t)
+                for step in self.steps:
+                    step(c, R, cx, RX, H, t)
         finally:
             for m in self.monitors:
                 m.group._task_ended()
@@ -552,6 +552,7 @@ class Assertions:
         h.enabled_any = True
         root.assertions.append(h)
         domain.monitors.append(h)
+        domain.steps.append(h.step)
         domain.start()
         return h
 
@@ -862,6 +863,7 @@ class Assertions:
         for h in root.assertions:
             if h in h.domain.monitors:
                 h.domain.monitors.remove(h)
+                h.domain.steps.remove(h.step)
             h.monitor.finish(h.domain.tickno)
         root._log_summary()
         errors = root.errors
