@@ -1,0 +1,388 @@
+# cocotbext-sva — design
+
+Status: draft, pre-implementation. This document records the design decisions
+made before the first line of the package was written. It is the reference for
+contributors; update it when a decision changes.
+
+## 1. Goal
+
+Bring SystemVerilog assertions to cocotb testbenches, in Python, for designs in
+any HDL that cocotb supports:
+
+- immediate assertions (`assert`, `assume`, `cover`, deferred `#0` / `final`);
+- concurrent (temporal) assertions written in **SVA syntax**, covering almost
+  all useful SVA operators, sampled-value functions and directives;
+- fast enough to leave on in regressions.
+
+Out of scope for now: PSL syntax, `checker` blocks, formal verification.
+
+## 2. Requirements
+
+| # | Requirement | Consequence |
+|---|---|---|
+| R1 | Speed is critical | Compiled automata, shared sampling loop, demand-driven reads (§5, §11) |
+| R2 | Each failure is reported **at the simulation time it happens** | Synchronous evaluation is the default; batching is opt-in only |
+| R3 | Failures do **not** stop the test; they are collected and the test fails at its end | `@checked` / `async with` finalization (§7.3); `$fatal` severity still stops immediately |
+| R4 | cocotb 2.x only | No 1.x compatibility layer; use the 2.x value and trigger APIs |
+| R5 | Direct mode (no HDL changes) is the default | Correct sampling and fast reads must be achieved from Python alone |
+| R6 | Works on nvc, GHDL, Verilator, Icarus (and other cocotb-supported simulators) | Per-simulator calibration tests; CI matrix |
+| R7 | Open-source package for everyone | Must handle many clock domains, both edges, VHDL and Verilog conventions; BSD-3-Clause |
+| R8 | SVA syntax only (for now) | Hand-written SVA parser; internal representation is syntax-neutral |
+
+## 3. Architecture overview
+
+```
+ SVA text / builder API
+          │  front end (once, at test start)
+          ▼
+   parse → IR (syntax tree, every node carries its clocking event)
+          │  compiler (once)
+          ▼
+   atomic conditions → numbered input bits
+   sequences → NFA (Thompson construction; and/intersect/within as products)
+   properties → attempt-merging automaton
+   condition evaluation → generated Python source, exec'd
+          │  runtime (every sampled clock event)
+          ▼
+   Sampler ──(cycle, time, sampled values)──▶ Engine ──events──▶ Reporter
+```
+
+The **engine never touches cocotb**. It consumes a stream of sampled values per
+clocking event, produced by a pluggable `Sampler`. This one seam makes the
+engine testable without a simulator, enables offline checking of waveform
+dumps, and lets new sampling strategies (gated clocks, HDL probes) be added
+without touching the engine.
+
+| Sampler | Phase | Purpose |
+|---|---|---|
+| `EdgeSampler` | 1 | Reads at the clock-edge callback. Correct for clocks driven from cocotb |
+| `TraceSampler` | 1 (tests), 3 (users) | Replays traces / FST / VCD; engine unit tests and offline checking |
+| `PreponedSampler` | 4 | Correct sampling for clocks generated or gated inside the HDL |
+| `ProbeSampler` | 4 | Optional generated HDL wrapper: HDL-side sampling, one packed read, batching |
+
+**Clocking event** is an object, not a signal: signal + edge
+(`posedge` / `negedge` / `edge`) + optional `iff` condition. All assertions on
+the same clocking event share one sampling loop.
+
+**Multi-clock readiness:** every IR node carries its clocking event from day
+one, even though v1 accepts only one clock per property. Multi-clock sequences
+(`@(posedge a) x ##1 @(posedge b) y`) and `$past(..., @(clk))` are then a later
+extension of the compiler, not a rewrite.
+
+## 4. Front end
+
+- Hand-written recursive-descent parser with precedence climbing, following the
+  operator precedence table of IEEE 1800. Chosen for precise error messages
+  (caret under the offending token) and zero dependencies.
+- A Python builder API (`seq(req).delay(1, 3).then(ack)`) produces the same IR.
+- Every IR node keeps its source span, so failures can underline the
+  sub-expression that failed.
+
+### 4.1 Name resolution
+
+Names in SVA text are resolved **once, when the assertion is created**, in this
+order:
+
+1. `signals=` (explicit handles / aliases)
+2. `values=` (Python callables sampled at the clock event)
+3. `params=` (constants, folded into generated code)
+4. named sequences / properties
+5. local variables
+6. the `scope` hierarchy (case-insensitive for VHDL)
+
+Unresolved names fail at test setup with close-match suggestions. Typing rules:
+`std_logic` / `bit` are booleans; vectors are unsigned (`$signed()` available);
+VHDL enum literals compile to integer compares; `sig[7:0]` follows the declared
+range direction (`to` / `downto`); record fields as `rec.field` where the
+simulator exposes them. Expression operators are SV's (`==`, `!=`, `&&`) for
+both languages.
+
+## 5. Engine
+
+### 5.1 Fast path — attempt-merging lazy DFA
+
+For properties without local variables, an attempt's entire future depends only
+on its position in the property. Attempts at the same position are
+interchangeable, so the set of all in-flight attempts is one state of a
+deterministic automaton (subset construction over the NFA).
+
+- The DFA is built **lazily** (as RE2 does): a transition is computed the first
+  time a (state, input-bits) pair occurs, then cached together with its events
+  (pass, fail, vacuous pass, cover hit, source span of a failure).
+- Per assertion per cycle: one generated predicate call + one dict lookup,
+  **independent of the number of attempts in flight**.
+- Each DFA state also stores, cheaply, the start cycle of its oldest attempt and
+  the number of merged attempts, for failure reports.
+
+### 5.2 Slow path — tokens for local variables
+
+`(valid, v = data) |=> ##[1:8] (out == v)`: attempts at the same position with
+different captured values are not interchangeable, and the value space is too
+large to tabulate. These assertions run as a set of tokens
+(NFA state, captured values); identical tokens are merged. Cost grows with the
+number of outstanding attempts, but only for these assertions and only while
+something is outstanding — while waiting for the antecedent they cost the same
+as fast-path assertions. Local variables are in v1.
+
+### 5.3 `cover` counting
+
+SVA counts every matching attempt; merging loses multiplicity. Cover properties
+keep a count per state (no full merging), so hit counts match SVA.
+
+### 5.4 Demand-driven reads
+
+Each DFA state knows which atomic conditions its outgoing transitions depend
+on. Each cycle the sampling loop reads only the union of signals required by the
+current states of all assertions on that clocking event. An idle
+`req |-> ##[1:3] ack` reads only `req`.
+
+Always-read signals: operands of `$past` / `$rose` / `$fell` / `$stable` /
+`$changed` (their history must be continuous), kept in ring buffers sized by the
+largest `$past` depth. `disable iff` operands are read only when the assertion
+is not idle.
+
+### 5.5 Idle sleep (phase 3)
+
+When every assertion on a clocking event is idle, stop awaiting the clock and
+await value changes of the signals the idle states depend on (plus history
+signals). No change event means the value stayed constant, so history stays
+valid. Enabled only after the reference-model fuzzing (§10) passes on it.
+
+## 6. Sampling semantics
+
+SVA samples values in the Preponed region — before the clock edge's updates.
+
+- **Clock driven from cocotb** (`cocotb.clock.Clock`, including the GPI clock):
+  the edge callback runs before the design reacts to the edge on all supported
+  simulators, so reads return pre-edge values — correct SVA sampling.
+  `EdgeSampler` is supported for this case.
+- **Clock generated or derived inside the HDL**: on Verilator the callback runs
+  after the evaluation step (post-edge values); on event-driven simulators a
+  delta-cycle race can partly expose updated values. The package detects this
+  case and warns; correct support arrives with `PreponedSampler` (phase 4).
+
+Phase 0 verifies these statements with a calibration test on every simulator.
+
+X/Z handling: by default an unknown value in a boolean condition is false (like
+an `if`). A strict mode treats unknown in a condition as a failure.
+`std_logic` `H`/`L` count as 1/0; `U X W Z -` count as unknown.
+
+## 7. User-facing behavior
+
+### 7.1 Reporting at failure time
+
+Logged through cocotb's logger at the failing sample, so it carries the
+simulation time and interleaves with the rest of the testbench log:
+
+```
+ 160.00ns ERROR  sva.top.req_ack  FAILED  (attempt started 120.00ns, cycle 12 → 16)
+   req |-> ##[1:3] ack
+                   ^^^ not seen within [1:3] cycles
+   sampled: req@120=1  ack@130=0 ack@140=0 ack@150=0
+```
+
+The sampled-values line comes from a small history buffer (on by default).
+Full value traces of every involved signal are an opt-in debug mode, because
+they defeat demand-driven reads. Optional: a marker file of failure times for
+waveform viewers.
+
+### 7.2 Severity
+
+SV semantics: `$info` / `$warning` / `$error` are logged and collected;
+`$fatal` stops the test immediately. Overridable per assertion. Custom action
+callbacks (`on_fail=`, `on_pass=`) are supported.
+
+### 7.3 Finalization
+
+At the end of a checked region the package checks pending strong obligations
+(`s_eventually`, `s_until`, …), logs a summary (attempts, real passes, vacuous
+passes, failures, cover hits, never-triggered warnings) and fails the test if
+any assertion failed.
+
+- `@checked` decorator under `@cocotb.test()` — the standard form.
+- `async with assertions:` — limits checking to part of a test.
+- Safety net: if a test ends with uncollected failures (neither form used), a
+  loud error is logged when cocotb cancels the test's tasks.
+
+Engine tasks live per test (cocotb 2.x cancels test tasks at test end).
+
+### 7.4 Assertion control
+
+`on()` / `off()` / `kill()` with glob patterns on names — equivalents of
+`$asserton` / `$assertoff` / `$assertkill` / `$assertcontrol`, including
+pass/fail/vacuous action control.
+
+## 8. Keyword coverage
+
+**Immediate:** `assert`, `assume`, `cover`; deferred `#0` and `final`
+(evaluated once in the ReadOnly phase of the time step, last evaluation wins).
+
+**Sequences:** `##n`, `##[m:n]`, `##[m:$]`, `##[*]`, `##[+]`; `[*n]`, `[*m:n]`,
+`[*]`, `[+]`, `[->n]`, `[=n]`; `and`, `or`, `intersect`, `within`,
+`throughout`, `first_match`; `.triggered` / `.ended`.
+
+**Properties:** `|->`, `|=>`, `#-#`, `#=#`, `not`, `and`, `or`, `if`/`else`,
+`case`, `implies`, `iff`; `disable iff` (and group default); `nexttime`,
+`s_nexttime`, `always`, `s_always`, `eventually`, `s_eventually`, `until`,
+`s_until`, `until_with`, `s_until_with`; `accept_on`, `reject_on`,
+`sync_accept_on`, `sync_reject_on`; `strong()`, `weak()`.
+
+**Sampled-value / bit functions:** `$past(e, n, gate)`, `$rose`, `$fell`,
+`$stable`, `$changed`, `$sampled`, `$onehot`, `$onehot0`, `$isunknown`,
+`$countones`, `$countbits`, `$signed`, `$unsigned`.
+
+**Directives:** `assert property`, `assume property` (as assert in simulation),
+`cover property`, `cover sequence`, `expect` (`await a.expect(...)`).
+Named / parameterized sequences and properties; `let` as a macro.
+
+**Deferred:** `checker` blocks (use Python classes), `restrict`, global-clock
+functions (`$past_gclk` …), recursive properties, multi-clock sequences
+(phase 4).
+
+## 9. Semantic decisions to pin down in phase 1
+
+- what `$past` returns before enough history exists (SV: the initial value of
+  the expression's type — X for 4-state);
+- vacuous vs. real pass classification for every operator;
+- end-of-test treatment of pending weak vs. strong obligations;
+- `cover` multiplicity under overlapping matches;
+- deferred-assertion flush points in cocotb's scheduler.
+
+## 10. Verification strategy
+
+1. **Reference interpreter** — a deliberately slow, literal implementation of
+   the formal SVA semantics (IEEE 1800 Annex F). The fast engine is fuzzed
+   against it with random properties and random traces, in-process, no
+   simulator.
+2. **Golden corpus** — properties and traces run through a mature commercial
+   SVA implementation; the normalized results (failure times, attempt start
+   times, pass / vacuous counts, cover hits, pending strong obligations) are
+   committed as plain files. Public CI replays the corpus through the engine
+   with no commercial tool. When engine and reference interpreter agree but the
+   corpus disagrees, our reading of the LRM is re-checked; the LRM is the
+   authority and deviations are documented. Committed files contain no tool
+   names or version strings.
+3. **Cross-simulator trace player** — one DUT in VHDL and one in Verilog
+   replays traces; the same cocotb test runs on every simulator. Differences
+   between simulators point at sampling / access bugs, not engine bugs.
+4. **Native oracles** — Verilator's SVA support and GHDL's PSL support cross-
+   check the subset they implement.
+5. **Calibration tests** per simulator: pre/post-edge reads, enum and record
+   access, hierarchical access, read cost.
+
+Discrepancies found by fuzzing are shrunk automatically to a minimal property +
+trace and added to the regression suite.
+
+## 11. Performance strategy
+
+| Tier | Technique | Phase |
+|---|---|---|
+| 1 | One sampling loop per clocking event; lazy DFA; each signal read at most once per cycle; demand-driven reads | 1 |
+| 2 | Fast read path: avoid building `LogicArray` objects; integer reads by default, string reads only when X detection is needed. Private cocotb API isolated in one adapter module with a public-API fallback | 1 |
+| 3 | Idle sleep | 3 |
+| 4 | Optional compiled kernel (Rust/PyO3, abi3 wheels) with pure-Python fallback — only if benchmarks show the Python loop dominates | 3 |
+| 5 | `TraceSampler` offline mode on FST/VCD dumps (zero simulation overhead) | 3 |
+| 6 | `ProbeSampler`: generated HDL wrapper (VHDL-2008 external names / Verilog hierarchical references), one packed read per cycle, optional HDL-side batching (reports delayed by ≤ N cycles, failure time still exact) | 4 |
+
+Phase 0 benchmarks set concrete targets (e.g. "≤ 1.3× slowdown with 100
+assertions on nvc") against a no-assertion baseline and a naive
+coroutine-per-attempt implementation.
+
+## 12. Packaging and development
+
+- Distribution `cocotbext-sva`, import `cocotbext.sva`, BSD-3-Clause.
+- Pure-Python wheel; only runtime dependency is cocotb 2.x.
+- `nox` is the single task runner on Windows, WSL/Linux and CI.
+- Simulator matrix: nvc, GHDL, Verilator, Icarus on Linux; nvc on Windows.
+  Other cocotb-supported simulators are expected to work through the same
+  cocotb interfaces.
+
+## 13. Phases
+
+0. **Calibration and benchmarks** on every simulator: sampling behavior
+   (cocotb-driven vs. HDL clocks), read cost (public vs. low-level API),
+   baseline speed, naive-implementation cost, golden-corpus output format.
+1. **Core:** parser + IR, NFA + lazy DFA, `EdgeSampler` with demand-driven
+   reads, immediate + deferred assertions, sampled-value functions, all
+   sequence operators, implications, `disable iff`, clocking events with `iff`,
+   local variables, reporting + finalization, reference interpreter + fuzzing,
+   golden-corpus harness.
+2. **Full property language:** `always` / `eventually` / `until` /
+   `nexttime`, `accept_on` / `reject_on`, `cover`, `expect`, assertion control,
+   statistics, vacuity warnings.
+3. **Speed:** idle sleep, optional compiled kernel, offline `TraceSampler`.
+4. **Clocking extensions:** `PreponedSampler`, multi-clock sequences,
+   `ProbeSampler`, library of ready-made checkers.
+
+## Appendix A — API sketch (not implemented)
+
+```python
+import cocotb
+from cocotb.clock import Clock
+from cocotbext.sva import Assertions, Checker, Property, checked, posedge
+
+VALID_HELD = Property("valid && !ready |=> valid && $stable(data)",
+                      args=("valid", "ready", "data"))
+
+class StreamChecker(Checker):                  # like an SV checker / bind module
+    ports = ("clk", "rst_n", "valid", "ready", "data")
+    clock = "posedge clk"
+    disable_iff = "!rst_n"
+
+    def build(self, a):
+        a.assert_property(VALID_HELD(valid="valid", ready="ready", data="data"),
+                          name="valid_held")
+        a.assert_property("!$isunknown(valid)", name="valid_known")
+        a.cover_property("(valid && !ready)[*3]", name="backpressure_3")
+
+def my_assertions(dut, model):
+    a = Assertions(scope=dut, clock=posedge(dut.clk), disable_iff="!rst_n",
+                   name="top", params={"DEPTH": 16})
+    a.assert_property("req |-> ##[1:3] ack", name="req_gets_ack")
+    a.assert_property("u_ctrl.state == BUSY && done |=> u_ctrl.state == IDLE",
+                      name="fsm_returns_idle")              # VHDL enum literals
+    a.assert_property("@(posedge clk) disable iff (!rst_n) "
+                      "$rose(start) |=> busy until_with done", name="busy_until_done")
+    a.assert_property("go |=> ##[0:15] fin", name="alu_latency",
+                      signals={"go": dut.u_core.u_alu.op_start_i,
+                               "fin": dut.u_core.u_alu.op_done_o})
+    a.assert_property("out_valid && out_ready |-> out_data == expected",
+                      name="matches_model", values={"expected": model.peek_next})
+    a.assert_property("(req && ack, t = req_tag) |-> ##[1:8] (resp && resp_tag == t)",
+                      name="resp_tag_matches")              # local variable
+    a.sequence("burst4", "(in_valid && in_ready)[*4]")
+    a.cover_property("burst4 ##1 !in_valid", name="burst_then_idle")
+    a.assert_property("full |-> !in_ready", name="no_accept_when_full",
+                      severity="fatal",
+                      message="accepted data while full (count={u_ctrl.count})",
+                      on_fail=lambda failure: model.dump_debug(failure))
+    a.assert_property("psel && !penable |=> psel && penable", name="apb_access",
+                      clock=posedge(dut.pclk), disable_iff="!presetn")
+    a.assert_property("busy |-> !start", name="no_restart",
+                      clock=posedge(dut.clk).iff("clk_en"))
+    StreamChecker(a, name="in", clk=dut.clk, rst_n=dut.rst_n,
+                  valid=dut.in_valid, ready=dut.in_ready, data=dut.in_data)
+    for i in range(4):
+        StreamChecker(a, name=f"lane{i}", scope=dut.g_lane[i])
+    return a
+
+@cocotb.test()
+@checked                                    # collect failures, fail at test end
+async def test_traffic(dut):
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    a = my_assertions(dut, model := RefModel())
+    a.off("top.matches_model")
+    await reset(dut)
+    a.on("top.matches_model")
+    a.check("u_ctrl.count == 0", msg="counter not cleared by reset")   # immediate
+    a.check("!(full && empty)", deferred=True)                          # assert #0
+    await drive_traffic(dut, model, n=10_000)
+    ok = await a.expect("##[1:20] done", name="start_completes")
+
+@cocotb.test()
+async def test_after_config(dut):
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    await configure(dut)
+    async with my_assertions(dut, RefModel()):  # checked only inside the block
+        await drive_traffic(dut, RefModel(), n=1_000)
+```
