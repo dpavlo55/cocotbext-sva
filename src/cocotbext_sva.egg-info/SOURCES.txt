@@ -1,7 +1,0 @@
-README.md
-pyproject.toml
-src/cocotbext_sva.egg-info/PKG-INFO
-src/cocotbext_sva.egg-info/SOURCES.txt
-src/cocotbext_sva.egg-info/dependency_links.txt
-src/cocotbext_sva.egg-info/requires.txt
-src/cocotbext_sva.egg-info/top_level.txt
