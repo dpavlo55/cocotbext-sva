@@ -9,3 +9,5 @@ work/
 *.log
 .pytest_cache/
 local/
+calibration/results.jsonl
+benchmarks/results*.jsonl

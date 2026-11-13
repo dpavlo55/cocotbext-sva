@@ -27,6 +27,36 @@ def _selected_sims(session):
     return found
 
 
+VHDL_ONLY = {"nvc", "ghdl"}
+VERILOG_ONLY = {"icarus", "verilator"}
+
+
+def _langs(sim):
+    if sim in VHDL_ONLY:
+        return ["vhdl"]
+    if sim in VERILOG_ONLY:
+        return ["verilog"]
+    return ["vhdl", "verilog"]  # mixed-language simulators: run both tops
+
+
+def _run_everywhere(session, script):
+    for sim in _selected_sims(session):
+        for lang in _langs(sim):
+            session.log(f"--- {script} on {sim}/{lang} ---")
+            session.run(sys.executable, script, env={"SIM": sim, "TOPLEVEL_LANG": lang},
+                        external=True)
+
+
+@nox.session(python=False)
+def calibrate(session):
+    """Phase 0: sampling calibration (pre- vs post-edge reads per clock kind)."""
+    out = "calibration/results.jsonl"
+    if os.path.exists(out):
+        os.remove(out)
+    _run_everywhere(session, "calibration/run.py")
+    session.run(sys.executable, "calibration/report.py", external=True)
+
+
 @nox.session(python=False)
 def smoke(session):
     """Minimal cocotb 2.x test on each simulator (VHDL and/or Verilog top)."""
