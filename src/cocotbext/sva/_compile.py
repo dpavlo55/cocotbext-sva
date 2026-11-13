@@ -22,7 +22,7 @@ from ._errors import SvaError, SvaNameError, SvaUnsupportedError
 from ._expr import (HELPERS, Code, ConstRef, ExprCompiler, LocalRef, Resolver, SignalRef,
                     TriggeredRef, mask, walk)
 from ._nfa import Builder
-from ._prop import VPASS, AndT, ConstT, IfT, ImplT, NotT, OrT, SeqT
+from ._prop import VPASS, AndT, ConstT, FollowedByT, IffT, IfT, ImpliesT, ImplT, NotT, OrT, SeqT
 
 
 @dataclass
@@ -50,6 +50,7 @@ class Program:
     clock: object                      # A.ClockEvent | None
     slots: set = field(default_factory=set)   # all value slots read by atoms
     warnings: list = field(default_factory=list)
+    contradiction: bool = False           # some transition was dropped as unsatisfiable
     _bitsfn_cache: dict = field(default_factory=dict, repr=False)
     _envfns: list = field(default_factory=list, repr=False)
     _actfns: list = field(default_factory=list, repr=False)
@@ -202,7 +203,7 @@ class _Ctx(Resolver):
             const = self._const_bool(e)
             if const is not None:
                 if const != pol:
-                    return self.false_guard()
+                    return False
                 continue
             is_env, i = self.atom(self.ec.boolean(e))
             if is_env:
@@ -257,7 +258,10 @@ class Compiler:
             disable_atom = ctx.atom(code)[1]
         self.envmode = bool(local_names)
         strength = "strong" if kind == "cover" else "weak"
+        from ._nfa import CONTRADICTION
+        CONTRADICTION["seen"] = False
         tmpl = self.prop(spec.prop, strength)
+        contradiction = CONTRADICTION["seen"]
         natoms = len(ctx.atoms)
         prog = Program(
             text=self.text, kind=kind, tmpl=tmpl, envmode=self.envmode,
@@ -267,6 +271,7 @@ class Compiler:
             start_bit=1 << natoms, clock=spec.clock,
         )
         prog.warnings = list(self.warnings)
+        prog.contradiction = contradiction
         for c in ctx.atoms + ctx.env_atoms:
             prog.slots |= c.slots
         for c, _ in ctx.actions:
@@ -289,24 +294,21 @@ class Compiler:
             ante = self.nfa(node.seq)
             if node.op in ("|->", "|=>"):
                 return ImplT(ante, self.prop(node.prop, strength), node.op == "|->", env)
-            # S #-# P == not (S |-> not P): P sits under two negations, so it
-            # keeps the context strength.
-            inner = NotT(self.prop(node.prop, strength))
-            return NotT(ImplT(ante, inner, node.op == "#-#", env))
+            return FollowedByT(ante, self.prop(node.prop, strength), node.op == "#-#", env)
         if isinstance(node, A.PNot):
-            return NotT(self.prop(node.prop, _flip(strength)))
+            # The default strength of a sequence comes from the directive only
+            # (IEEE 1800 16.12.2); `not` does not change it.
+            return NotT(self.prop(node.prop, strength))
         if isinstance(node, A.PBin):
             if node.op == "and":
                 return AndT(self.prop(node.left, strength), self.prop(node.right, strength))
             if node.op == "or":
                 return OrT(self.prop(node.left, strength), self.prop(node.right, strength))
             if node.op == "implies":
-                return OrT(NotT(self.prop(node.left, _flip(strength))), self.prop(node.right, strength))
+                return ImpliesT(self.prop(node.left, strength), self.prop(node.right, strength))
             if node.op == "iff":
                 p, q = node.left, node.right
-                both = AndT(self.prop(p, strength), self.prop(q, strength))
-                neither = AndT(NotT(self.prop(p, _flip(strength))), NotT(self.prop(q, _flip(strength))))
-                return OrT(both, neither)
+                return IffT(self.prop(p, strength), self.prop(q, strength))
             raise SvaUnsupportedError(self._at(f"'{node.op}' is not supported yet", node))
         if isinstance(node, A.PIf):
             g = self.ctx.guard(node.cond)
@@ -364,6 +366,10 @@ class Compiler:
             g = self.ctx.guard(node.expr)
             if g is True:
                 return b.true()
+            if g is False:
+                from ._nfa import CONTRADICTION
+                CONTRADICTION["seen"] = True
+                return b.never()
             return b.guard(*g)
         if isinstance(node, A.SDelay):
             lo = self._count(node.lo)

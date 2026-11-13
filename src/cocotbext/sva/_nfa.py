@@ -24,19 +24,27 @@ from ._errors import SvaUnsupportedError
 TRUE_GUARD = (0, 0, 0, ())
 
 
+CONTRADICTION = {"seen": False}
+
+
 def merge_ops(a: tuple, b: tuple):
     """Concatenate two op tuples, merging adjacent guards.
 
-    Contradictory guards (an atom required both true and false) are kept: the
-    transition then simply never fires. Dropping it at build time would make
-    attempts fail one tick *before* the tick that actually decides them, which
-    differs from the formal semantics and from simulators.
+    A transition whose merged guard needs an atom both true and false can never
+    fire and is dropped at build time, so an attempt whose only continuation it
+    was fails one tick early. This matches a mature SVA implementation (golden
+    corpus); the formal truncated-path semantics would wait one more tick.
+    Returns None for such a transition.
     """
     ops = list(a)
     for op in b:
         if op[0] == 0 and ops and ops[-1][0] == 0:
             g = ops[-1]
-            ops[-1] = (0, g[1] | op[1], g[2] | op[2], g[3] + op[3])
+            pos, neg = g[1] | op[1], g[2] | op[2]
+            if pos & neg:
+                CONTRADICTION["seen"] = True
+                return None
+            ops[-1] = (0, pos, neg, g[3] + op[3])
         else:
             ops.append(op)
     return tuple(ops)
@@ -149,9 +157,11 @@ class Builder:
                     F.add(st)
             return st
 
+        # Empty matches of an operand do not take part in `and` (behaviour of a
+        # mature SVA implementation, recorded in the golden corpus).
         I = []
-        ia = list(a.I) + ([TOP] if keep_waiting and a.nullable else [])
-        ib = list(b.I) + ([TOP] if keep_waiting and b.nullable else [])
+        ia = list(a.I)
+        ib = list(b.I)
         for x in ia:
             for y in ib:
                 if (x, y) != (TOP, TOP):
@@ -165,6 +175,8 @@ class Builder:
                 if dx == TOP and dy == TOP:
                     continue
                 ops = merge_ops(ox, oy)
+                if ops is None:
+                    continue
                 if not keep_waiting:
                     self.add(src, ops, state((dx, dy)))
                     continue
@@ -172,7 +184,7 @@ class Builder:
                 vy = [dy] if dy == TOP else ([dy, TOP] if dy in b.F else [dy])
                 for p in product(vx, vy):
                     self.add(src, ops, final if p == (TOP, TOP) else state(p))
-        return Frag(I, F, a.nullable and b.nullable)
+        return Frag(I, F, a.nullable and b.nullable and not keep_waiting)
 
     def and_(self, a: Frag, b: Frag) -> Frag:
         return self._product(a, b, keep_waiting=True)

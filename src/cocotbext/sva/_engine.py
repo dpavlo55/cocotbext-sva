@@ -13,7 +13,7 @@ are stepped individually every tick (identical terms are still merged).
 """
 from __future__ import annotations
 
-from ._prop import FAIL, PASS, VPASS, Val
+from ._prop import FAIL, PASS, VFAIL, VPASS, Val
 
 DISABLED = 4
 MAX_STARTS = 16          # start times remembered per merged term
@@ -178,7 +178,7 @@ class Monitor:
             if self.prog.kind == "cover" or self.sink.wants_pass:
                 self.sink(PASS, self, count, self._starts(meta, tickno), tickno)
             return
-        if v == FAIL:
+        if v == FAIL or v == VFAIL:
             if self.prog.kind == "cover":
                 return            # a cover attempt that does not match is not an error
             st.failures += count

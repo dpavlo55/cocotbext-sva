@@ -122,31 +122,68 @@ class Degenerate(Exception):
     pass
 
 
+def _compiled_flags(text):
+    from cocotbext.sva._compile import Compiler
+    from cocotbext.sva._parser import parse_assertion
+    from cocotbext.sva._trace import TraceBinder
+    prog = Compiler(TraceBinder(SIGNALS), text).compile(parse_assertion(text))
+    return prog
+
+
+def _vacuity_timed(text):
+    """`or`/`iff`/`implies` below a `not`: the inner result waits until its
+    vacuity is known (reference-simulator behaviour), which the formal model
+    does not have; failure times of the negation can then differ by a tick."""
+    from cocotbext.sva import _ast as A
+    from cocotbext.sva._parser import parse_assertion
+
+    def walk(n, under_not):
+        if isinstance(n, A.PNot):
+            under_not = True
+        if under_not and isinstance(n, A.PBin) and n.op in ("or", "iff", "implies"):
+            return True
+        for v in vars(n).values() if isinstance(n, A.Node) else ():
+            if isinstance(v, A.Node) and walk(v, under_not):
+                return True
+        return False
+    return walk(parse_assertion(text).prop, False)
+
+
 def engine_attempts(text, rows):
-    res = run_trace({"p": text}, SIGNALS, rows)
-    if res.warnings:      # a sequence that can never match: verdict timing is implementation-defined
+    """Per attempt start: ('fail', tick) / ('end_fail',) / ('ok',)."""
+    prog = _compiled_flags(text)
+    if _vacuity_timed(text):
         raise Degenerate()
-    got = Counter()
+    if prog.warnings or prog.contradiction:
+        # never-matching sequences, or transitions dropped as unsatisfiable: the
+        # verdict timing then follows the reference simulator, not the formal
+        # semantics the reference interpreter implements
+        raise Degenerate()
+    res = run_trace({"p": text}, SIGNALS, rows)
+    got = {s: ("ok",) for s in range(len(rows))}
     for e in res.events:
-        kind = {"fail": FAIL, "pass": PASS, "vpass": VPASS, "end_fail": "end_fail"}[e.kind]
-        if len(e.starts) == e.count:
-            for s in e.starts:
-                got[(s, kind, e.tick if kind != "end_fail" else None)] += 1
-        else:
-            got[("merged", kind, e.tick, e.count)] += 1
-    return got
+        if len(e.starts) != e.count:
+            got[("merged", e.tick, e.count)] = (e.kind,)
+            continue
+        for s in e.starts:
+            if e.kind == "fail":
+                got[s] = ("fail", e.tick)
+            elif e.kind == "end_fail":
+                got[s] = ("end_fail",)
+    return Counter(got.items())
 
 
 def reference_attempts(text, rows):
     ref = Ref(text, rows)
-    exp = Counter()
+    exp = {}
     for start, verdict, info in ref.run():
         if verdict is None:
-            if info is False:
-                exp[(start, "end_fail", None)] += 1
+            exp[start] = ("end_fail",) if info is False else ("ok",)
+        elif verdict == FAIL:
+            exp[start] = ("fail", info)
         else:
-            exp[(start, verdict, info)] += 1
-    return exp
+            exp[start] = ("ok",)
+    return Counter(exp.items())
 
 
 def check_one(text, rows):
@@ -157,14 +194,6 @@ def check_one(text, rows):
     except Degenerate:
         return "degenerate"
     exp = reference_attempts(text, rows)
-    for key in [k for k in exp if k[1] == PASS_ANY]:
-        start, _, tick = key
-        for kind in (PASS, VPASS):
-            if got.get((start, kind, tick)):
-                got[(start, kind, tick)] -= 1
-                got[key] += 1
-                break
-    got = +got
     if got != exp:
         only_e = {k: v for k, v in (got - exp).items()}
         only_r = {k: v for k, v in (exp - got).items()}

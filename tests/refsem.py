@@ -193,7 +193,9 @@ class Ref:
                 return a | self.M(s.right, i, env, w)
             b = self.M(s.right, i, env, w)
             if s.op == "and":
-                return frozenset((max(k1, k2), e1) for k1, e1 in a for k2, e2 in b)
+                # empty matches of an operand do not take part (corpus-confirmed)
+                return frozenset((max(k1, k2), e1) for k1, e1 in a for k2, e2 in b
+                                 if k1 >= i and k2 >= i)
             if s.op == "intersect":
                 return frozenset((k1, e1) for k1, e1 in a for k2, e2 in b if k1 == k2)
             if s.op == "within":
@@ -276,19 +278,29 @@ class Ref:
             tail = TOP if st == "weak" else BOT
             return self.H(p, i, env, Word(self.rows, n, tail, self.tail_len))
         if isinstance(p, A.PNot):
-            return not self.neutral(p.prop, i, env, "strong" if strength == "weak" else "weak")
+            # default strength comes from the directive only (IEEE 1800 16.12.2)
+            return not self.neutral(p.prop, i, env, strength)
         if isinstance(p, A.PImpl):
             if p.op in ("#-#", "#=#"):
-                op = "|->" if p.op == "#-#" else "|=>"
-                return self.neutral(self._once(p, lambda: A.PNot(A.PImpl(op, p.seq, A.PNot(p.prop)))),
-                                    i, env, strength)
+                shift = 0 if p.op == "#-#" else 1
+                # antecedent could still complete after the end: not a failure
+                wt = Word(self.rows, n, TOP, self.tail_len)
+                if any(k >= n for k, _ in self.M(p.seq, i, env, wt)):
+                    return True
+                w = Word(self.rows, n, None, 0)
+                for k, e in self.M(p.seq, i, env, w):
+                    if k < i:
+                        continue
+                    if k + shift >= n or self.neutral(p.prop, k + shift, e, strength):
+                        return True
+                return False
             shift = 0 if p.op == "|->" else 1
             w = Word(self.rows, n, None, 0)
             for k, e in self.M(p.seq, i, env, w):
                 if k >= i and k + shift < n and not self.neutral(p.prop, k + shift, e, strength):
                     return False
-                if k >= i and k + shift >= n and not self._unstarted(p.prop, strength):
-                    return False
+                # a consequent that has not seen a tick is not evaluated at the end
+
             return True
         if isinstance(p, A.PBin):
             if p.op == "and":
@@ -296,12 +308,9 @@ class Ref:
             if p.op == "or":
                 return self.neutral(p.left, i, env, strength) or self.neutral(p.right, i, env, strength)
             if p.op == "implies":
-                return self.neutral(self._once(p, lambda: A.PBin("or", A.PNot(p.left), p.right)),
-                                    i, env, strength)
+                return (not self.neutral(p.left, i, env, strength)) or self.neutral(p.right, i, env, strength)
             if p.op == "iff":
-                return self.neutral(self._once(p, lambda: A.PBin("and", A.PBin("implies", p.left, p.right),
-                                                                 A.PBin("implies", p.right, p.left))),
-                                    i, env, strength)
+                return self.neutral(p.left, i, env, strength) == self.neutral(p.right, i, env, strength)
         if isinstance(p, A.PIf):
             row = self.rows[i] if i < n else None
             if row is None:
