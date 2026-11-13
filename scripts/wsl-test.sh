@@ -24,10 +24,13 @@ rsync -a --delete --exclude '.git/' --exclude '.venv/' --exclude 'sim_build/' \
 cd "$dst"
 
 if [ ! -x .venv/bin/python ]; then python3 -m venv .venv; fi
+# Reinstall when dependencies or the package layout change (editable installs
+# record which directories are packages).
 stamp=.venv/.requirements.sha
-if ! sha256sum -c --status "$stamp" 2>/dev/null; then
+want=$({ cat requirements.txt pyproject.toml; find src -name '__init__.py' | sort; } | sha256sum)
+if [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
     .venv/bin/pip install -q --upgrade pip
     .venv/bin/pip install -q -r requirements.txt
-    sha256sum requirements.txt pyproject.toml > "$stamp"
+    echo "$want" > "$stamp"
 fi
 exec .venv/bin/nox "$@"

@@ -12,3 +12,4 @@ local/
 calibration/results.jsonl
 benchmarks/results*.jsonl
 *.egg-info/
+calibration/types.jsonl

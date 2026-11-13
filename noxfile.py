@@ -50,11 +50,16 @@ def _run_everywhere(session, script):
 @nox.session(python=False)
 def calibrate(session):
     """Phase 0: sampling calibration (pre- vs post-edge reads per clock kind)."""
-    out = "calibration/results.jsonl"
-    if os.path.exists(out):
-        os.remove(out)
+    for out in ("calibration/results.jsonl", "calibration/types.jsonl"):
+        if os.path.exists(out):
+            os.remove(out)
     _run_everywhere(session, "calibration/run.py")
     session.run(sys.executable, "calibration/report.py", external=True)
+    for sim in _selected_sims(session):
+        for lang in _langs(sim):
+            session.run(sys.executable, "calibration/run_types.py",
+                        env={"SIM": sim, "TOPLEVEL_LANG": lang}, external=True, success_codes=[0, 1])
+    session.run(sys.executable, "calibration/report_types.py", external=True)
 
 
 @nox.session(python=False)
@@ -71,6 +76,12 @@ def bench(session):
 def tests(session):
     """Unit tests and differential fuzzing (no simulator)."""
     session.run(sys.executable, "-m", "pytest", "-q", "tests", *session.posargs, external=True)
+
+
+@nox.session(python=False)
+def simtests(session):
+    """End-to-end tests of the package on simulators."""
+    _run_everywhere(session, "tests/sim/run.py")
 
 
 @nox.session(python=False)

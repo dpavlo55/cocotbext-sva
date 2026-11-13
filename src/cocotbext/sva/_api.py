@@ -1,0 +1,1003 @@
+"""User-facing API: assertion groups bound to a cocotb design."""
+from __future__ import annotations
+
+import difflib
+import functools
+import inspect
+import logging
+import sys
+from collections import deque
+from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
+from typing import Any, Callable
+
+import cocotb
+from cocotb.triggers import FallingEdge, ReadOnly, RisingEdge, ValueChange
+
+from . import _ast as A
+from ._access import signal_info, x_reader
+from ._compile import Compiler, NamedDef, gen_value_fn, substitute
+from ._engine import Monitor
+from ._errors import SvaError, SvaNameError
+from ._expr import ConstRef, ExprCompiler, Resolver, SignalRef
+from ._parser import parse_assertion, parse_expression, parse_sequence_or_property
+from ._prop import FAIL, PASS
+
+_log = logging.getLogger("sva")
+
+SEVERITIES = ("info", "warning", "error", "fatal")
+
+
+# --------------------------------------------------------------------------
+# Clocking events
+# --------------------------------------------------------------------------
+
+class ClockingEvent:
+    """A clock signal, an edge and an optional `iff` condition."""
+
+    def __init__(self, signal, edge: str = "posedge", iff: str | None = None):
+        if edge not in ("posedge", "negedge", "edge"):
+            raise ValueError("edge must be 'posedge', 'negedge' or 'edge'")
+        self.signal = signal
+        self.edge = edge
+        self.iff_text = iff
+
+    def iff(self, condition: str) -> "ClockingEvent":
+        """Qualify the clock: ticks only count when `condition` is true (like `@(posedge clk iff en)`)."""
+        return ClockingEvent(self.signal, self.edge, condition)
+
+    def __repr__(self):
+        name = getattr(self.signal, "_path", self.signal)
+        s = f"{self.edge} {name}"
+        return f"@({s} iff {self.iff_text})" if self.iff_text else f"@({s})"
+
+
+def posedge(signal) -> ClockingEvent:
+    return ClockingEvent(signal, "posedge")
+
+
+def negedge(signal) -> ClockingEvent:
+    return ClockingEvent(signal, "negedge")
+
+
+def edge(signal) -> ClockingEvent:
+    return ClockingEvent(signal, "edge")
+
+
+# --------------------------------------------------------------------------
+# Reusable properties and sequences
+# --------------------------------------------------------------------------
+
+class Property:
+    """A property (or sequence) with formal arguments, like an SV `property ... endproperty`.
+
+        VALID_HELD = Property("valid && !ready |=> valid && $stable(data)",
+                              args=("valid", "ready", "data"))
+        a.assert_property(VALID_HELD(valid="in_valid", ready="in_ready", data=dut.in_data))
+
+    Actual arguments are names or expressions (strings) resolved in the
+    assertion's scope, or signal handles.
+    """
+
+    def __init__(self, text: str, args: tuple = ()):
+        self.text = text
+        self.args = tuple(args)
+        self.ast = parse_sequence_or_property(text)
+
+    def __call__(self, *pos, **kw) -> "BoundProperty":
+        if len(pos) > len(self.args):
+            raise TypeError(f"too many arguments (property takes {len(self.args)})")
+        bindings = dict(zip(self.args, pos))
+        for k, v in kw.items():
+            if k not in self.args:
+                raise TypeError(f"unknown argument '{k}' (expected one of {self.args})")
+            bindings[k] = v
+        missing = [a for a in self.args if a not in bindings]
+        if missing:
+            raise TypeError(f"missing argument(s): {', '.join(missing)}")
+        return BoundProperty(self, bindings)
+
+
+@dataclass
+class BoundProperty:
+    prop: Property
+    bindings: dict
+
+    @property
+    def text(self):
+        return self.prop.text
+
+
+Sequence = Property
+
+
+# --------------------------------------------------------------------------
+# Failures and results
+# --------------------------------------------------------------------------
+
+@dataclass
+class Failure:
+    """One reported failure (several merged attempts are reported once with count > 1)."""
+    name: str
+    text: str
+    time: float                  # simulation time of the failure, in ns
+    start_times: list            # start times of the failing attempts (ns), oldest first
+    count: int = 1
+    severity: str = "error"
+    message: str = ""
+    values: dict = field(default_factory=dict)
+    at_end: bool = False         # strong obligation still pending at the end
+    immediate: bool = False
+
+    def __str__(self):
+        when = "at end of test" if self.at_end else f"at {self.time:g} ns"
+        return f"{self.name} failed {when}: {self.text}"
+
+
+def _now_ns(steps: int) -> float:
+    from cocotb.utils import get_time_from_sim_steps
+    return get_time_from_sim_steps(steps, "ns")
+
+
+def _sim_steps() -> int:
+    from cocotb.simtime import get_sim_time
+    return get_sim_time("step")
+
+
+# --------------------------------------------------------------------------
+# Name resolution against a cocotb hierarchy
+# --------------------------------------------------------------------------
+
+def _child(handle, name: str):
+    for cand in (name, name.lower(), name.upper()):
+        try:
+            return getattr(handle, cand)
+        except AttributeError:
+            continue
+    return None
+
+
+def _names_under(handle) -> list:
+    try:
+        return [c._name for c in handle]
+    except Exception:
+        return []
+
+
+class _Domain:
+    """All assertions sampled on one clocking event share one loop and one value cache."""
+
+    def __init__(self, key, clock_handle, edge_kind: str, label: str):
+        self.key = key
+        self.clock_handle = clock_handle
+        self.edge = edge_kind
+        self.label = label
+        self.slot_of: dict = {}
+        self.R: list = []
+        self.labels: list = []
+        self.xslot_of: dict = {}
+        self.RX: list = []
+        self.channels: list = []       # (vfn, gfn, ring)
+        self.channel_of: dict = {}
+        self.monitors: list = []
+        self.iff_fn = None
+        self.tickno = -1
+        self._now_tick = None
+        self._now = 0
+        self.task = None
+        self.c: list = []
+        self.cx: list = []
+        self.H: list = []
+
+    # slots
+    def slot(self, handle, info) -> int:
+        key = getattr(handle, "_handle", handle)
+        s = self.slot_of.get(key)
+        if s is None:
+            s = self.slot_of[key] = len(self.R)
+            self.R.append(info.reader)
+            self.labels.append(info.label)
+            self.c.append(None)
+        return s
+
+    def value_slot(self, key, fn, label) -> int:
+        s = self.slot_of.get(key)
+        if s is None:
+            s = self.slot_of[key] = len(self.R)
+            self.R.append(fn)
+            self.labels.append(label)
+            self.c.append(None)
+        return s
+
+    def xslot(self, handle) -> int:
+        key = getattr(handle, "_handle", handle)
+        s = self.xslot_of.get(key)
+        if s is None:
+            s = self.xslot_of[key] = len(self.RX)
+            from cocotb.handle import EnumObject, IntegerObject
+            self.RX.append((lambda: 0) if isinstance(handle, (IntegerObject, EnumObject)) else x_reader(handle))
+            self.cx.append(None)
+        return s
+
+    def channel(self, key, code, width, gcode, depth) -> int:
+        k = self.channel_of.get(key)
+        if k is None:
+            k = self.channel_of[key] = len(self.channels)
+            vfn = gen_value_fn(code, width)
+            gfn = gen_value_fn(gcode) if gcode is not None else None
+            # Prime the history with the value at creation time ("default sampled value").
+            self.H.append(None)
+            c = [None] * len(self.R)
+            cx = [None] * len(self.RX)
+            try:
+                init = vfn(c, self.R, cx, self.RX, self.H)
+            except Exception:
+                init = None
+            self.channels.append((vfn, gfn, deque([init] * depth, maxlen=depth)))
+        return k
+
+    def now(self) -> int:
+        if self._now_tick != self.tickno:
+            self._now_tick = self.tickno
+            self._now = _sim_steps()
+        return self._now
+
+    def start(self):
+        if self.task is None or self.task.done():
+            self.task = cocotb.start_soon(self._run())
+
+    async def _run(self):
+        h = self.clock_handle
+        trig = RisingEdge(h) if self.edge == "posedge" else FallingEdge(h) if self.edge == "negedge" \
+            else ValueChange(h)
+        try:
+            while True:
+                await trig
+                self.tickno += 1
+                c, cx, H, R, RX = self.c, self.cx, self.H, self.R, self.RX
+                for i in range(len(c)):
+                    c[i] = None
+                for i in range(len(cx)):
+                    cx[i] = None
+                if self.iff_fn is not None and not self.iff_fn(c, R, cx, RX, H):
+                    continue
+                for k, (vfn, gfn, ring) in enumerate(self.channels):
+                    H[k] = ring[0]
+                    cur = vfn(c, R, cx, RX, H)
+                    if gfn is None or gfn(c, R, cx, RX, H):
+                        ring.append(cur)
+                t = self.tickno
+                for m in self.monitors:
+                    if m.enabled_any:
+                        m.step(c, R, cx, RX, H, t)
+        finally:
+            for m in self.monitors:
+                m.group._task_ended()
+
+
+_domains: dict = {}
+
+
+def _get_domain(clock_handle, edge_kind, iff_text, scope_key, label) -> _Domain:
+    key = (getattr(clock_handle, "_handle", clock_handle), edge_kind, iff_text, scope_key if iff_text else None)
+    d = _domains.get(key)
+    if d is None or (d.task is not None and d.task.done()):
+        d = _domains[key] = _Domain(key, clock_handle, edge_kind, label)
+    return d
+
+
+class _Binder(Resolver):
+    """Resolves names for one assertion: overrides, constants, then the scope hierarchy."""
+
+    def __init__(self, group: "Assertions", domain: _Domain | None, signals: dict, values: dict):
+        self.group = group
+        self.domain = domain
+        self.signals = signals
+        self.values = values
+
+    def lookup(self, path):
+        name = ".".join(path)
+        g = self.group
+        if name in self.signals:
+            return self._signal_ref(self.signals[name], name)
+        if name in self.values:
+            fn = self.values[name]
+            width = 64
+            if isinstance(fn, tuple):
+                fn, width = fn
+            m = (1 << width) - 1
+            slot = self.domain.value_slot(("value", id(fn)), lambda: int(fn()) & m, name)
+            return SignalRef(slot, width, False, label=name)
+        for consts in g._const_chain():
+            if name in consts:
+                v = consts[name]
+                return ConstRef(int(v))
+        handle = g._resolve_path(path)
+        if handle is None:
+            return None
+        return self._signal_ref(handle, name)
+
+    def _signal_ref(self, handle, name):
+        if isinstance(handle, str):
+            raise SvaError(f"'{name}' is bound to an expression; use it as a port of a Checker or Property")
+        info = signal_info(handle, name)
+        slot = self.domain.slot(handle, info)
+        self.group._handles_by_slot[(id(self.domain), slot)] = handle
+        return SignalRef(slot, info.width, info.signed, info.left, info.right, label=name)
+
+    def suggest(self, path):
+        return self.group._suggest(path)
+
+    # Resolver interface for expressions compiled outside a property
+    # (immediate assertions, clock `iff` conditions).
+    def resolve(self, ident):
+        ref = self.lookup(ident.path)
+        if ref is None:
+            s = self.suggest(ident.path)
+            hint = f" (did you mean {', '.join(repr(x) for x in s)}?)" if s else ""
+            raise SvaNameError(f"unknown name '{ident.name}'{hint}")
+        return ref
+
+    def local_width(self, ref):
+        raise SvaError("local variables are only available in properties")
+
+    def triggered_channel(self, name):
+        raise SvaError("'.triggered' is only available in properties")
+
+    def x_slot(self, ref):
+        handle = self.group._handles_by_slot.get((id(self.domain), ref.slot))
+        if handle is None:
+            raise SvaError(f"X detection is not available for '{ref.label}'")
+        return self.domain.xslot(handle)
+
+    def history_channel(self, key, code, width, gcode, depth):
+        if self.domain is None:
+            raise SvaError("sampled-value functions need a clock (not available in immediate assertions)")
+        return self.domain.channel(key, code, width, gcode, depth)
+
+
+# --------------------------------------------------------------------------
+# Assertion instances
+# --------------------------------------------------------------------------
+
+class AssertionHandle:
+    """An assertion attached to a clocking domain (returned by assert_property & co.)."""
+
+    def __init__(self, group, name, prog, domain, severity, message, on_fail, on_pass):
+        self.group = group
+        self.name = name
+        self.prog = prog
+        self.domain = domain
+        self.severity = severity
+        self.message = message
+        self.on_fail = on_fail
+        self.on_pass = on_pass
+        self.kind = prog.kind
+        self.monitor = Monitor(prog, name, self, domain)
+        self.enabled_any = True
+        self.step = self.monitor.tick_env if prog.envmode else self.monitor.tick
+        self.wants_pass = on_pass is not None or prog.kind == "cover"
+        self.wants_vacuous = False
+        self.hits = 0
+
+    @property
+    def stats(self) -> dict:
+        d = self.monitor.stats.as_dict()
+        if self.kind == "cover":
+            d = {"attempts": d["attempts"], "hits": d["passes"]}
+        return d
+
+    @property
+    def enabled(self) -> bool:
+        return self.monitor.enabled
+
+    # sink protocol used by the engine
+    def __call__(self, verdict, mon, count, starts, tickno, at_end=False):
+        if verdict == PASS:
+            self.hits += count
+            if self.on_pass is not None:
+                self.on_pass(self)
+            return
+        if verdict != FAIL:
+            return
+        self.group._report_failure(self, count, starts, at_end)
+
+
+# --------------------------------------------------------------------------
+# Assertion groups
+# --------------------------------------------------------------------------
+
+_test_groups: list = []        # groups created in the current @checked test
+
+
+class Assertions:
+    """A group of assertions on one design scope.
+
+    Args:
+        scope: hierarchy handle (usually `dut`) in which bare names are looked up.
+        clock: default clocking event: `posedge(dut.clk)`, a clock handle (posedge),
+            or a string such as "posedge clk" / "@(negedge clk iff en)".
+        disable_iff: default `disable iff` condition (SVA expression string).
+        name: prefix for assertion names in reports.
+        params: constants usable in assertions (`DEPTH`, ...).
+        enums: an `enum.IntEnum` class or a dict of enumeration literals
+            (`state == S_BUSY`); values are what cocotb reads for the signal.
+        signals: name -> handle aliases usable in every assertion of the group.
+    """
+
+    def __init__(self, scope=None, clock=None, disable_iff: str | None = None, name: str = "sva",
+                 params: dict | None = None, enums=None, signals: dict | None = None,
+                 lets: dict | None = None, parent: "Assertions | None" = None):
+        self.scope = scope
+        self.clock = clock
+        self.disable_iff = disable_iff
+        self.name = name
+        self.params = dict(params or {})
+        if enums is not None:
+            self.params.update(_enum_dict(enums))
+        self.signals = dict(signals or {})
+        self.lets = {k: parse_sequence_or_property(v) if isinstance(v, str) else v
+                     for k, v in (lets or {}).items()}
+        self.parent = parent
+        self.root = parent.root if parent else self
+        self.named: dict = dict(parent.named) if parent else {}
+        if parent is None:
+            self.assertions: list[AssertionHandle] = []
+            self.failures: list[Failure] = []
+            self.immediate_stats: dict = {}
+            self._handles_by_slot: dict = {}
+            self._finalized = False
+            self._deferred: dict = {}
+            self._deferred_task = None
+            self._unchecked_warned = False
+            self._count = 0
+            _test_groups.append(self)
+        self._imm_cache: dict = {}
+
+    # -- configuration helpers ------------------------------------------------
+    def _const_chain(self):
+        g = self
+        while g is not None:
+            yield g.params
+            g = g.parent
+
+    @property
+    def _handles_by_slot(self):
+        return self.root.__dict__["_handles_by_slot"] if self.root is not self else self.__dict__["_handles_by_slot"]
+
+    @_handles_by_slot.setter
+    def _handles_by_slot(self, v):
+        self.__dict__["_handles_by_slot"] = v
+
+    def _resolve_path(self, path):
+        if self.scope is None:
+            return None
+        h = self.scope
+        for part in path:
+            h = _child(h, part)
+            if h is None:
+                return None
+        return h
+
+    def _suggest(self, path):
+        h = self.scope
+        for part in path[:-1]:
+            h = _child(h, part) if h is not None else None
+        names = list(self.signals) + (_names_under(h) if h is not None else [])
+        return difflib.get_close_matches(path[-1], names, n=3)
+
+    def _full_name(self, name):
+        return f"{self.name}.{name}" if self.name else name
+
+    def sequence(self, name: str, text: str, args: tuple = ()):
+        """Define a named sequence usable by name in later assertions (`burst4 ##1 idle`)."""
+        self.named[name] = NamedDef(name, parse_sequence_or_property(text), tuple(args), text)
+
+    def let(self, name: str, text: str):
+        """Define a named expression (macro), like SV `let`."""
+        self.lets[name] = parse_sequence_or_property(text)
+
+    # -- concurrent assertions ----------------------------------------------
+    def assert_property(self, prop, name: str | None = None, *, clock=None, disable_iff=...,
+                        signals: dict | None = None, values: dict | None = None,
+                        severity: str = "error", message: str | None = None,
+                        on_fail: Callable | None = None, on_pass: Callable | None = None) -> AssertionHandle:
+        """Check a concurrent property on every clock tick (SV `assert property`).
+
+        `values` maps names to Python callables sampled at the clock tick.
+        `message` may reference signals in braces: "count={u_ctrl.count}".
+        """
+        return self._add("assert", prop, name, clock, disable_iff, signals, values, severity, message,
+                         on_fail, on_pass)
+
+    def assume_property(self, prop, name: str | None = None, **kw) -> AssertionHandle:
+        """SV `assume property` (checked like an assertion in simulation)."""
+        kw.setdefault("disable_iff", ...)
+        return self._add("assume", prop, name, kw.pop("clock", None), kw.pop("disable_iff"),
+                         kw.pop("signals", None), kw.pop("values", None), kw.pop("severity", "error"),
+                         kw.pop("message", None), kw.pop("on_fail", None), kw.pop("on_pass", None))
+
+    def cover_property(self, prop, name: str | None = None, *, clock=None, disable_iff=...,
+                       signals: dict | None = None, values: dict | None = None,
+                       on_hit: Callable | None = None) -> AssertionHandle:
+        """Count matches of a property or sequence (SV `cover property`)."""
+        return self._add("cover", prop, name, clock, disable_iff, signals, values, "info", None, None,
+                         on_hit)
+
+    def _add(self, kind, prop, name, clock, disable_iff, signals, values, severity, message,
+             on_fail, on_pass):
+        root = self.root
+        if severity not in SEVERITIES:
+            raise ValueError(f"severity must be one of {SEVERITIES}")
+        root._count += 1
+        name = self._full_name(name or f"{kind}{root._count}")
+        overrides = dict(self._signals_chain())
+        overrides.update(signals or {})
+        text, spec, extra_named = self._prepare(prop, overrides)
+        clock_ev = self._clock_for(spec.clock, clock, overrides)
+        domain = self._domain_for(clock_ev, overrides)
+        binder = _Binder(self, domain, overrides, dict(values or {}))
+        dis = None
+        if disable_iff is ...:
+            disable_iff = self._default_disable()
+        if disable_iff is not None and spec.disable is None:
+            dis = self._expand_lets(parse_expression(disable_iff))
+        named = dict(self.named)
+        named.update(extra_named)
+        compiler = Compiler(binder, text, named)
+        prog = compiler.compile(spec, kind, default_disable=dis)
+        for w in prog.warnings:
+            _log.warning("%s: %s", name, w)
+        h = AssertionHandle(root, name, prog, domain, severity, message, on_fail, on_pass)
+        h.enabled_any = True
+        root.assertions.append(h)
+        domain.monitors.append(h)
+        domain.start()
+        return h
+
+    def _signals_chain(self):
+        chain = []
+        g = self
+        while g is not None:
+            chain.append(g.signals)
+            g = g.parent
+        for d in reversed(chain):
+            yield from d.items()
+
+    def _default_disable(self):
+        g = self
+        while g is not None:
+            if g.disable_iff is not None:
+                return g.disable_iff
+            g = g.parent
+        return None
+
+    def _prepare(self, prop, overrides):
+        """Parse the property text; substitute lets and Property arguments."""
+        extra_named = {}
+        if isinstance(prop, BoundProperty):
+            text = prop.text
+            mapping = {}
+            for k, v in prop.bindings.items():
+                if isinstance(v, str):
+                    mapping[k] = parse_sequence_or_property(v)
+                else:
+                    alias = f"__arg_{k}_{id(v)}"
+                    overrides[alias] = v
+                    mapping[k] = A.Id((alias,))
+            spec = A.AssertionSpec(None, None, substitute(prop.prop.ast, mapping))
+        elif isinstance(prop, Property):
+            if prop.args:
+                raise SvaError("this Property has arguments; call it with actual arguments first")
+            text = prop.text
+            spec = A.AssertionSpec(None, None, prop.ast)
+        else:
+            text = prop
+            spec = parse_assertion(text)
+        lets = self._lets_chain()
+        if lets:
+            spec = A.AssertionSpec(spec.clock, spec.disable, self._expand_lets(spec.prop), span=spec.span)
+        return text, spec, extra_named
+
+    def _lets_chain(self):
+        out = {}
+        chain = []
+        g = self
+        while g is not None:
+            chain.append(g.lets)
+            g = g.parent
+        for d in reversed(chain):
+            out.update(d)
+        return out
+
+    def _expand_lets(self, node):
+        lets = self._lets_chain()
+        if not lets:
+            return node
+        return substitute(node, lets)
+
+    def _clock_for(self, spec_clock, clock_arg, overrides):
+        if spec_clock is not None:
+            sig = self._clock_signal(spec_clock.signal, overrides)
+            iff = None
+            if spec_clock.iff is not None:
+                iff = spec_clock.iff
+            return ("ast", sig, spec_clock.edge or "edge", iff)
+        clk = clock_arg if clock_arg is not None else self._default_clock()
+        if clk is None:
+            raise SvaError("no clock: give the group a clock=, pass clock= or write @(posedge clk) in the property")
+        if isinstance(clk, str):
+            text = clk.strip()
+            if not text.startswith("@"):
+                text = f"@({text})"
+            ev = parse_assertion(text + " 1").clock
+            return ("ast", self._clock_signal(ev.signal, overrides), ev.edge or "edge", ev.iff)
+        if isinstance(clk, ClockingEvent):
+            iff = parse_expression(clk.iff_text) if clk.iff_text else None
+            return ("ast", clk.signal, clk.edge, iff)
+        return ("ast", clk, "posedge", None)
+
+    def _default_clock(self):
+        g = self
+        while g is not None:
+            if g.clock is not None:
+                return g.clock
+            g = g.parent
+        return None
+
+    def _clock_signal(self, node, overrides):
+        if not isinstance(node, A.Id):
+            raise SvaError("clock must be a signal name")
+        name = node.name
+        if name in overrides:
+            return overrides[name]
+        h = self._resolve_path(node.path)
+        if h is None:
+            raise SvaNameError(f"unknown clock signal '{name}'")
+        return h
+
+    def _domain_for(self, clock_ev, overrides):
+        _, sig, edge_kind, iff = clock_ev
+        iff_text = None
+        if iff is not None:
+            iff_text = _node_text(iff)
+        label = f"{edge_kind} {getattr(sig, '_path', sig)}"
+        d = _get_domain(sig, edge_kind, iff_text, id(self), label)
+        if iff is not None and d.iff_fn is None:
+            binder = _Binder(self, d, overrides, {})
+            ec = ExprCompiler(binder, iff_text)
+            d.iff_fn = gen_value_fn(ec.boolean(self._expand_lets(iff)))
+        return d
+
+    # -- immediate assertions -----------------------------------------------
+    def check(self, expr, msg: str | None = None, *, name: str | None = None, deferred: bool = False,
+              severity: str = "error", signals: dict | None = None, values: dict | None = None) -> bool | None:
+        """Immediate assertion (SV `assert (expr) else $error(msg)`).
+
+        `expr` is an SVA expression string or a Python callable returning a bool.
+        A failure is logged at the current simulation time and collected; the
+        test continues. With deferred=True the check runs once at the end of
+        the current time step (ReadOnly phase), and only the last call per
+        name/call site in that time step counts (SV `assert #0`).
+        """
+        return self._immediate("assert", expr, msg, name, deferred, severity, signals, values)
+
+    def assume(self, expr, msg: str | None = None, **kw):
+        """Immediate assumption (checked like an assertion in simulation)."""
+        return self._immediate("assume", expr, msg, kw.get("name"), kw.get("deferred", False),
+                               kw.get("severity", "error"), kw.get("signals"), kw.get("values"))
+
+    def cover(self, expr, name: str | None = None, *, signals: dict | None = None,
+              values: dict | None = None) -> bool:
+        """Immediate cover: counts how often `expr` is true when called."""
+        return self._immediate("cover", expr, None, name, False, "info", signals, values)
+
+    def _immediate(self, kind, expr, msg, name, deferred, severity, signals, values):
+        root = self.root
+        if name is None:
+            caller = sys._getframe(2)
+            label = expr if isinstance(expr, str) else getattr(expr, "__name__", "check")
+            key = (caller.f_code.co_filename, caller.f_lineno)
+            name = self._full_name(f"{kind}@{caller.f_code.co_name}:{caller.f_lineno}")
+        else:
+            key = name = self._full_name(name)
+            label = expr if isinstance(expr, str) else getattr(expr, "__name__", "check")
+        fn = self._imm_fn(expr, signals, values)
+        if deferred:
+            root._deferred[key] = (kind, fn, name, label, msg, severity)
+            if root._deferred_task is None or root._deferred_task.done():
+                root._deferred_task = cocotb.start_soon(root._flush_deferred())
+            return None
+        return root._eval_immediate(kind, fn, name, label, msg, severity)
+
+    def _imm_fn(self, expr, signals, values):
+        if callable(expr):
+            return lambda: bool(expr())
+        key = (expr, tuple(sorted((signals or {}).items(), key=lambda kv: kv[0])),
+               tuple(sorted((values or {}).items(), key=lambda kv: kv[0])))
+        fn = self._imm_cache.get(key)
+        if fn is None:
+            overrides = dict(self._signals_chain())
+            overrides.update(signals or {})
+            dom = _Domain(None, None, "none", "immediate")
+            binder = _Binder(self, dom, overrides, dict(values or {}))
+            node = self._expand_lets(parse_expression(expr))
+            ec = ExprCompiler(binder, expr)
+            code = ec.boolean(node)
+            vfn = gen_value_fn(code)
+
+            def fn(dom=dom, vfn=vfn):
+                c = [None] * len(dom.R)
+                cx = [None] * len(dom.RX)
+                return bool(vfn(c, dom.R, cx, dom.RX, []))
+            self._imm_cache[key] = fn
+        return fn
+
+    def _eval_immediate(self, kind, fn, name, label, msg, severity):
+        st = self.immediate_stats.setdefault(name, {"kind": kind, "evaluations": 0, "failures": 0, "hits": 0})
+        st["evaluations"] += 1
+        ok = fn()
+        if kind == "cover":
+            if ok:
+                st["hits"] += 1
+            return ok
+        if not ok:
+            st["failures"] += 1
+            t = _now_ns(_sim_steps())
+            f = Failure(name, label, t, [t], 1, severity, msg or "", immediate=True)
+            self._record(f, None)
+        return ok
+
+    async def _flush_deferred(self):
+        await ReadOnly()
+        pending, self._deferred = self._deferred, {}
+        for kind, fn, name, label, msg, severity in pending.values():
+            self._eval_immediate(kind, fn, name, label, msg, severity)
+
+    # -- reporting ------------------------------------------------------------
+    def _report_failure(self, h: AssertionHandle, count, starts, at_end):
+        steps_now = h.domain.now()
+        t = _now_ns(steps_now)
+        start_ns = [_now_ns(s[1]) for s in sorted(starts)]
+        values = {}
+        if not at_end:
+            d = h.domain
+            for slot in sorted(h.prog.slots):
+                v = d.c[slot]
+                if v is None:
+                    try:
+                        v = d.R[slot]()
+                    except Exception:
+                        continue
+                values[d.labels[slot]] = v
+        msg = h.message or ""
+        if msg and "{" in msg:
+            msg = self._format_message(msg, h)
+        f = Failure(h.name, h.prog.text, t, start_ns, count, h.severity, msg, values, at_end)
+        self._record(f, h)
+
+    def _format_message(self, msg, h):
+        import re
+
+        def repl(m):
+            try:
+                handle = self._resolve_path(tuple(m.group(1).split(".")))
+                return str(int(handle.value)) if handle is not None else m.group(0)
+            except Exception:
+                return m.group(0)
+        return re.sub(r"\{([A-Za-z_][\w.]*)\}", repl, msg)
+
+    def _record(self, f: Failure, h):
+        self.failures.append(f)
+        log = _log.getChild(f.name)
+        level = {"info": logging.INFO, "warning": logging.WARNING, "error": logging.ERROR,
+                 "fatal": logging.CRITICAL}[f.severity]
+        lines = []
+        if f.at_end:
+            lines.append(f"FAILED at end of test: strong obligation still pending"
+                         + (f" ({f.count} attempts)" if f.count > 1 else ""))
+        elif f.immediate:
+            lines.append("FAILED (immediate assertion)")
+        else:
+            starts = ", ".join(f"{s:g} ns" for s in f.start_times[:4])
+            more = "" if len(f.start_times) <= 4 and f.count <= len(f.start_times) else ", ..."
+            extra = f" ({f.count} attempts)" if f.count > 1 else ""
+            lines.append(f"FAILED{extra}  attempt started {starts}{more}")
+        lines.append(f"    {f.text}")
+        if f.message:
+            lines.append(f"    {f.message}")
+        if f.values:
+            lines.append("    sampled: " + "  ".join(f"{k}={_fmt(v)}" for k, v in f.values.items()))
+        log.log(level, "\n".join(lines))
+        if h is not None and h.on_fail is not None:
+            h.on_fail(f)
+        if f.severity == "fatal":
+            raise AssertionError(str(f))
+
+    # -- control ----------------------------------------------------------------
+    def _matching(self, pattern):
+        return [h for h in self.root.assertions if fnmatchcase(h.name, pattern)]
+
+    def off(self, pattern: str = "*"):
+        """Stop starting new attempts ($assertoff); attempts in flight complete."""
+        for h in self._matching(self._full_pattern(pattern)):
+            h.monitor.enabled = False
+
+    def on(self, pattern: str = "*"):
+        """Resume starting attempts ($asserton)."""
+        for h in self._matching(self._full_pattern(pattern)):
+            h.monitor.enabled = True
+
+    def kill(self, pattern: str = "*"):
+        """Abort attempts in flight and stop starting new ones ($assertkill)."""
+        for h in self._matching(self._full_pattern(pattern)):
+            h.monitor.kill()
+            h.monitor.enabled = False
+
+    def _full_pattern(self, pattern):
+        if self.name and not pattern.startswith(self.root.name):
+            return f"{self.name}.{pattern}" if pattern != "*" else f"{self.name}.*"
+        return pattern
+
+    # -- results and finalization -------------------------------------------
+    def stats(self) -> dict:
+        """name -> counters (attempts, passes, vacuous, failures, ...)."""
+        out = {h.name: h.stats for h in self.root.assertions}
+        out.update(self.root.immediate_stats)
+        return out
+
+    @property
+    def errors(self) -> list:
+        return [f for f in self.root.failures if f.severity in ("error", "fatal")]
+
+    def finalize(self, raise_on_failure: bool = True) -> list:
+        """End checking: report pending strong obligations, log a summary, and
+        raise AssertionError if any assertion failed with severity error/fatal."""
+        root = self.root
+        if root._finalized:
+            return root.errors
+        root._finalized = True
+        if root in _test_groups:
+            _test_groups.remove(root)
+        for h in root.assertions:
+            if h in h.domain.monitors:
+                h.domain.monitors.remove(h)
+            h.monitor.finish(h.domain.tickno)
+        root._log_summary()
+        errors = root.errors
+        if errors and raise_on_failure:
+            n = sum(f.count for f in errors)
+            names = sorted({f.name for f in errors})
+            raise AssertionError(f"{n} assertion failure(s) in {len(names)} assertion(s): "
+                                 + ", ".join(names[:10]) + (" ..." if len(names) > 10 else ""))
+        return errors
+
+    def _log_summary(self):
+        rows = []
+        never = []
+        for h in self.assertions:
+            st = h.monitor.stats
+            if h.kind == "cover":
+                rows.append(f"  {h.name:<40} cover    hits={st.passes}")
+                continue
+            rows.append(f"  {h.name:<40} {h.kind:<7} attempts={st.attempts} pass={st.passes} "
+                        f"vacuous={st.vacuous} fail={st.failures}" + (f" disabled={st.disabled}" if st.disabled else ""))
+            if st.passes == 0 and st.failures == 0 and st.attempts:
+                never.append(h.name)
+        for name, st in self.immediate_stats.items():
+            if st["kind"] == "cover":
+                rows.append(f"  {name:<40} cover    hits={st['hits']} of {st['evaluations']}")
+            else:
+                rows.append(f"  {name:<40} {st['kind']:<7} evaluations={st['evaluations']} fail={st['failures']}")
+        nfail = sum(f.count for f in self.errors)
+        head = f"assertion summary ({self.name}): {len(self.assertions)} concurrent, " \
+               f"{len(self.immediate_stats)} immediate, {nfail} failure(s)"
+        _log.info("%s\n%s", head, "\n".join(rows))
+        for name in never:
+            _log.warning("%s: never triggered (all attempts vacuous)", name)
+
+    def _task_ended(self):
+        if not self._finalized and not self._unchecked_warned and self.errors:
+            self._unchecked_warned = True
+            _log.error("%d assertion failure(s) were never checked: use @checked on the test, "
+                       "'async with' or call finalize()", sum(f.count for f in self.errors))
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.finalize(raise_on_failure=exc_type is None)
+        return False
+
+
+def _fmt(v):
+    return f"{v:#x}" if isinstance(v, int) and v > 9 else str(v)
+
+
+def _node_text(node) -> str:
+    return repr(node)
+
+
+def _enum_dict(enums) -> dict:
+    if isinstance(enums, dict):
+        return dict(enums)
+    try:
+        return {m.name: int(m.value) for m in enums}
+    except TypeError:
+        raise TypeError("enums must be an IntEnum class or a dict") from None
+
+
+def checked(func):
+    """Decorator for cocotb tests: collect assertion failures and fail the test at its end.
+
+        @cocotb.test()
+        @checked
+        async def test_traffic(dut): ...
+    """
+    if not inspect.iscoroutinefunction(func):
+        raise TypeError("@checked must decorate an async test function")
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = len(_test_groups)
+        try:
+            await func(*args, **kwargs)
+        except BaseException:
+            for g in _test_groups[start:]:
+                g.finalize(raise_on_failure=False)
+            del _test_groups[start:]
+            raise
+        groups = _test_groups[start:]
+        del _test_groups[start:]
+        errors = []
+        for g in groups:
+            errors += g.finalize(raise_on_failure=False)
+        if errors:
+            n = sum(f.count for f in errors)
+            names = sorted({f.name for f in errors})
+            raise AssertionError(f"{n} assertion failure(s) in {len(names)} assertion(s): "
+                                 + ", ".join(names[:10]) + (" ..." if len(names) > 10 else ""))
+    return wrapper
+
+
+class Checker:
+    """Reusable bundle of assertions with ports, like an SV checker bound with `bind`.
+
+        class StreamChecker(Checker):
+            ports = ("clk", "rst_n", "valid", "ready", "data")
+            clock = "posedge clk"
+            disable_iff = "!rst_n"
+
+            def build(self, a):
+                a.assert_property("valid && !ready |=> valid && $stable(data)", name="valid_held")
+
+        StreamChecker(a, name="in", clk=dut.clk, rst_n=dut.rst_n, valid=dut.in_valid, ...)
+        StreamChecker(a, name="lane0", scope=dut.g_lane[0])   # ports found by name in scope
+
+    A port can be bound to a handle or to an expression string.
+    """
+    ports: tuple = ()
+    clock = None
+    disable_iff = None
+
+    def __init__(self, group: Assertions, name: str | None = None, scope=None, **bindings):
+        unknown = set(bindings) - set(self.ports)
+        if unknown:
+            raise TypeError(f"{type(self).__name__} has no port(s) {', '.join(sorted(unknown))}")
+        signals, lets = {}, {}
+        for p in self.ports:
+            if p in bindings:
+                v = bindings[p]
+                if isinstance(v, str):
+                    lets[p] = v
+                else:
+                    signals[p] = v
+        name = name or type(self).__name__
+        full = f"{group.name}.{name}" if group.name else name
+        self.assertions = Assertions(scope=scope if scope is not None else group.scope,
+                                     clock=self.clock, disable_iff=self.disable_iff, name=full,
+                                     signals=signals, lets=lets, parent=group)
+        self.build(self.assertions)
+
+    def build(self, a: Assertions):
+        raise NotImplementedError("Checker subclasses implement build(self, a)")
