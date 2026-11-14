@@ -24,7 +24,15 @@ for c in meta["cases"]:
             "covers": sorted(e["covers"]),
             "counts": e.get("counts"),
         }
-    out.append({"id": c["id"], "props": c["props"], "kinds": c["kinds"], "trace": c["trace"], "ref": ref})
+    case = {"id": c["id"], "props": c["props"], "kinds": c["kinds"], "trace": c["trace"], "ref": ref}
+    if c.get("once"):
+        case["once"] = c["once"]
+    out.append(case)
 dest = ROOT / "tests" / "corpus" / "corpus.json"
+if dest.exists() and not meta.get("all"):
+    # incremental: keep existing cases, replace/append the newly run ones
+    old = json.loads(dest.read_text())["cases"]
+    new_ids = {c["id"] for c in out}
+    out = [c for c in old if c["id"] not in new_ids] + out
 dest.write_text(json.dumps({"rows": meta["rows"], "signals": meta["signals"], "cases": out}, indent=0))
 print(f"{len(out)} cases -> {dest}")

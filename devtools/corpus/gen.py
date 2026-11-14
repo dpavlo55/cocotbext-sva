@@ -11,7 +11,12 @@ Timing: clock period 10, first rising edge at 5 (signals at their initial
 value 0: tick 0). Row k of a trace is sampled at time 10*k + 15 (tick k + 1).
 The simulation ends after the last row.
 
-    python devtools/corpus/gen.py [--random N] [--seed S]
+    python devtools/corpus/gen.py [--random N] [--seed S] [--all]
+
+By default only cases whose id is not yet in tests/corpus/corpus.json are
+written (the merge step appends them); --all regenerates everything. The
+random phase 1 cases are not reproducible (the usability filter depends on
+the engine version), so --all replaces them.
 """
 from __future__ import annotations
 
@@ -70,6 +75,49 @@ DIRECTED = [
 ]
 DIRECTED_COVERS = ["a ##1 b ##1 c", "a ##[1:3] b", "a[*2] ##1 !a", "(a, v = x) ##1 y == v"]
 
+# Phase 2: temporal property operators. Appended with their own random stream
+# so that the phase 1 cases above stay unchanged.
+DIRECTED2 = [
+    # nexttime
+    "a |-> nexttime b", "a |-> nexttime[2] b", "a |-> s_nexttime b", "a |-> s_nexttime[2] b",
+    "a |-> nexttime[0] b", "a |-> nexttime (b ##1 c)", "a |=> s_nexttime (b |-> c)",
+    # always
+    "a |-> always [1:3] b", "a |-> s_always [1:3] b", "a |-> always [0:2] (b ##1 c)",
+    "a |-> always [2:$] b", "a |-> always b", "a |-> always (b |-> ##1 c)",
+    "a |-> s_always [0:2] (b |=> c)",
+    # eventually
+    "a |-> eventually [1:3] b", "a |-> eventually [0:2] (b ##1 c)", "a |-> s_eventually b",
+    "a |-> s_eventually [1:3] b", "a |-> s_eventually [2:$] b", "a |-> s_eventually (b ##1 c)",
+    "a |-> s_eventually (b |-> c)", "a |-> eventually [1:2] (b |=> c)",
+    # until
+    "a |-> b until c", "a |-> b s_until c", "a |-> b until_with c", "a |-> b s_until_with c",
+    "a |-> (b ##1 c) until d", "a |-> b until (c ##1 d)", "a |-> (b |-> c) until d",
+    "a |-> b s_until (c ##1 d)",
+    # aborts
+    "accept_on (c) a |-> ##[1:3] b", "reject_on (c) a |-> ##[1:3] b",
+    "sync_accept_on (c) a |=> b ##1 b", "sync_reject_on (c) a |=> b[*2]",
+    "a |-> accept_on (c) b[*3]", "a |-> reject_on (c) ##2 b", "accept_on (c) reject_on (d) a |=> b",
+    "a |-> sync_reject_on (c) s_eventually b", "a |-> accept_on (c) b until d",
+    # combinations
+    "not (a |-> eventually [1:2] b)", "a |-> not (b until c)", "a |-> not (s_eventually [0:2] b)",
+    "(a |-> always [0:2] b) or (c |-> s_eventually d)", "(a |-> nexttime b) and (c |-> b until d)",
+    "if (a) always [0:1] b else s_nexttime c", "a |-> (b until c) implies d",
+    "disable iff (rst) a |-> s_eventually b", "disable iff (rst) a |-> always [0:3] !c",
+    # empty antecedent matches (nested implications)
+    "a[*0:1] |=> b", "a |-> b[*0:1] |=> c", "a[*0:1] |-> b", "a |-> (b[*0:2] |-> c)",
+    "a |-> b[*0:1] |-> c", "a |=> b[*0:1] |=> c",
+]
+N_RANDOM2 = 150      # random properties with phase 2 operators
+
+# single-attempt assertions (SV: concurrent assertion in an initial block)
+DIRECTED2_ONCE = [
+    "always (a |-> ##[1:2] b)", "s_eventually (a && b)", "a until b", "a s_until b",
+    "always [2:$] (a || b)", "s_always [0:5] !rst", "nexttime[3] a", "s_nexttime[30] a",
+    "always s_eventually a", "s_eventually always !rst", "always (a |=> s_eventually b)",
+    "eventually [2:4] (a ##1 b)", "a until_with b", "always [0:$] (a -> b)",
+]
+DIRECTED2_COVERS = ["a #=# s_eventually b", "b until c", "a |-> always [0:1] b", "s_eventually (a ##1 b)"]
+
 
 def random_trace(rnd: random.Random, n: int) -> list:
     dens = rnd.choice([0.2, 0.4, 0.6])
@@ -103,6 +151,28 @@ def make_cases(n_random: int, seed: int) -> list:
         i += 1
         cases.append({"id": f"r{i:04d}", "props": {"p0": text}, "kinds": {"p0": "assert"},
                       "trace": random_trace(rnd, N_ROWS)})
+    rnd2 = random.Random(seed + 1)
+    for i, text in enumerate(DIRECTED2):
+        for k in range(3):
+            cases.append({"id": f"t{i:03d}_{k}", "props": {"p0": text}, "kinds": {"p0": "assert"},
+                          "trace": random_trace(rnd2, N_ROWS)})
+    for i, text in enumerate(DIRECTED2_ONCE):
+        for k in range(3):
+            cases.append({"id": f"o{i:03d}_{k}", "props": {"p0": text}, "kinds": {"p0": "assert"},
+                          "once": ["p0"], "trace": random_trace(rnd2, N_ROWS)})
+    g2 = Gen(rnd2, temporal=True)
+    i = 0
+    while i < N_RANDOM2:
+        text = g2.prop(rnd2.randint(1, 3))
+        if not _usable(text, "assert"):
+            continue
+        i += 1
+        cases.append({"id": f"s{i:04d}", "props": {"p0": text}, "kinds": {"p0": "assert"},
+                      "trace": random_trace(rnd2, N_ROWS)})
+    for i, text in enumerate(DIRECTED2_COVERS):
+        for k in range(2):
+            cases.append({"id": f"u{i:03d}_{k}", "props": {"p0": text}, "kinds": {"p0": "cover"},
+                          "trace": random_trace(rnd2, N_ROWS)})
     return cases
 
 
@@ -125,11 +195,12 @@ def emit_sv(cases: list) -> str:
                 # SV needs local variables declared in a named property
                 out.append(f"  property {name}_p; logic [2:0] v; {body}; endproperty")
                 body = f"{name}_p"
+            initial = "initial " if name in case.get("once", ()) else ""
             if case["kinds"][name] == "cover":
-                out.append(f"  {name}: cover property ({body}) "
+                out.append(f"  {initial}{name}: cover property ({body}) "
                            f"$display(\"@@COVER %m %0t\", $time);")
             else:
-                out.append(f"  {name}: assert property ({body}) "
+                out.append(f"  {initial}{name}: assert property ({body}) "
                            f"$display(\"@@PASS %m %0t\", $time);")
         out.append("endmodule")
         out.append("")
@@ -148,14 +219,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--random", type=int, default=300)
     ap.add_argument("--seed", type=int, default=2026)
+    ap.add_argument("--all", action="store_true", help="regenerate every case")
     ap.add_argument("--out", default=str(ROOT / "build" / "corpus"))
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     cases = make_cases(args.random, args.seed)
+    existing = ROOT / "tests" / "corpus" / "corpus.json"
+    if not args.all and existing.exists():
+        have = {c["id"] for c in json.loads(existing.read_text())["cases"]}
+        cases = [c for c in cases if c["id"] not in have]
     for idx, c in enumerate(cases):
         c["module"] = f"u_{idx}"
-    (out / "cases.json").write_text(json.dumps({"rows": N_ROWS, "signals": SIGNALS, "cases": cases}))
+    (out / "cases.json").write_text(json.dumps({"rows": N_ROWS, "signals": SIGNALS, "cases": cases,
+                                             "all": args.all}))
     (out / "tb.sv").write_text(emit_sv(cases))
     print(f"{len(cases)} cases -> {out}")
 
