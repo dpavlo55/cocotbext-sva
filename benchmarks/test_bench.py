@@ -305,13 +305,15 @@ def _time(fn):
     return time.perf_counter() - t0
 
 
-async def _package(dut, k, mixed=False):
+async def _package(dut, k, mixed=False, idle=False):
     from cocotbext.sva import Assertions, posedge
     stats = {}
 
     async def body():
         a = Assertions(dut, clock=posedge(dut.clk), name="b")
         texts = ["req |-> ##[1:3] ack"]
+        if idle:
+            texts = ["rare |-> ##[1:3] !rare", "rare |=> !rare"]
         if mixed:
             texts = ["req |-> ##[1:3] ack", "req |=> ##1 ack", "ack |-> $past(req, 2)",
                      "$rose(req) |-> ##2 ack", "req ##1 req |-> ##1 ack ##1 ack"]
@@ -322,7 +324,7 @@ async def _package(dut, k, mixed=False):
         st = a.stats()
         stats["passes"] = sum(v.get("passes", 0) for v in st.values())
         stats["failures"] = len(errs)
-    label = "mixed" if mixed else "same"
+    label = "mixed" if mixed else "idle" if idle else "same"
     await _timed(dut, f"5 cocotbext-sva x{k} {label}", body, stats=stats, assertions=k)
 
 
@@ -339,3 +341,8 @@ async def speed_5_package_50(dut):
 @cocotb.test()
 async def speed_5_package_50_mixed(dut):
     await _package(dut, 50, mixed=True)
+
+
+@cocotb.test()
+async def speed_5_package_50_idle(dut):
+    await _package(dut, 50, idle=True)

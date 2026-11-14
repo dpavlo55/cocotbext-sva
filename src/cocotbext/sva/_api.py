@@ -5,6 +5,7 @@ import difflib
 import functools
 import inspect
 import logging
+import os
 import sys
 from collections import deque
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ from fnmatch import fnmatchcase
 from typing import Any, Callable
 
 import cocotb
-from cocotb.triggers import FallingEdge, ReadOnly, RisingEdge, ValueChange
+from cocotb.triggers import Event, FallingEdge, ReadOnly, RisingEdge, ValueChange
 
 from . import _ast as A
 from ._access import signal_info, x_reader
@@ -165,7 +166,22 @@ def _names_under(handle) -> list:
 
 
 class _Domain:
-    """All assertions sampled on one clocking event share one loop and one value cache."""
+    """All assertions sampled on one clocking event share one loop and one value cache.
+
+    The loop is a callback on cocotb's edge trigger of the clock (re-armed at
+    every edge), not a task: it skips the task resume, the largest fixed cost
+    per tick. Trigger callbacks run before any task resumed by the same edge,
+    so the values read are never affected by writes a test makes at that edge.
+    An exception raised in it (fatal severity, user callbacks) is handed to a
+    small relay task that re-raises it in the test.
+
+    Idle sleep: after a tick where every assertion is idle (nothing in flight,
+    and the next ticks would only be counted, not reported) and the $past
+    histories are steady, the clock callback only counts edges. Value-change
+    callbacks on every signal the idle states read wake the domain up; the
+    counted ticks are then applied exactly (attempt and vacuity counters, tick
+    numbers). Disable with COCOTBEXT_SVA_IDLE_SLEEP=0.
+    """
 
     def __init__(self, key, clock_handle, edge_kind: str, label: str):
         self.key = key
@@ -175,13 +191,18 @@ class _Domain:
         self.slot_of: dict = {}
         self.R: list = []
         self.labels: list = []
+        self.handles: list = []        # slot -> signal handle (None: Python value)
         self.xslot_of: dict = {}
         self.RX: list = []
+        self.xhandles: list = []       # X slot -> signal handle
         self.channels: list = []       # (vfn, gfn, ring)
+        self.channel_slots: list = []  # (slots, xslots) read by each channel
         self.channel_of: dict = {}
         self.monitors: list = []
         self.steps: list = []          # bound step functions of the monitors (hot loop)
+        self.removals: list = []       # handles to detach after the current tick
         self.iff_fn = None
+        self.iff_slots = (frozenset(), frozenset())
         self.tickno = -1
         self._now_tick = None
         self._now = 0
@@ -189,6 +210,17 @@ class _Domain:
         self.c: list = []
         self.cx: list = []
         self.H: list = []
+        self.idle_sleep = IDLE_SLEEP
+        self.sleeping = False
+        self.skipped = 0               # edges counted while asleep
+        self.sleeps = 0                # statistics: times the domain went to sleep
+        self.stopped = True
+        self.error = None
+        self._cb = None                # armed clock callback (one-shot, re-armed each edge)
+        self._armed: set = set()       # signals with an armed wake-up callback
+        self._err = None
+        self._last_busy = 0
+        self._trig = None              # edge trigger of the clock (created on start)
 
     # slots
     def slot(self, handle, info) -> int:
@@ -198,6 +230,7 @@ class _Domain:
             s = self.slot_of[key] = len(self.R)
             self.R.append(info.reader)
             self.labels.append(info.label)
+            self.handles.append(handle)
             self.c.append(None)
         return s
 
@@ -207,6 +240,7 @@ class _Domain:
             s = self.slot_of[key] = len(self.R)
             self.R.append(fn)
             self.labels.append(label)
+            self.handles.append(None)
             self.c.append(None)
         return s
 
@@ -217,6 +251,7 @@ class _Domain:
             s = self.xslot_of[key] = len(self.RX)
             from cocotb.handle import EnumObject, IntegerObject
             self.RX.append((lambda: 0) if isinstance(handle, (IntegerObject, EnumObject)) else x_reader(handle))
+            self.xhandles.append(handle)
             self.cx.append(None)
         return s
 
@@ -235,6 +270,11 @@ class _Domain:
             except Exception:
                 init = None
             self.channels.append((vfn, gfn, deque([init] * depth, maxlen=depth)))
+            sl, xs = set(code.slots), set(code.xslots)
+            if gcode is not None:
+                sl |= gcode.slots
+                xs |= gcode.xslots
+            self.channel_slots.append((sl, xs))
         return k
 
     def now(self) -> int:
@@ -243,39 +283,152 @@ class _Domain:
             self._now = _sim_steps()
         return self._now
 
+    def detach(self, h):
+        if h in self.monitors:
+            self.monitors.remove(h)
+            self.steps.remove(h.step)
+
+    # -- loop ---------------------------------------------------------------
     def start(self):
         if self.task is None or self.task.done():
-            self.task = cocotb.start_soon(self._run())
+            self.stopped = False
+            self.error = None
+            self._err = Event()
+            self.task = cocotb.start_soon(self._relay())
+            self._arm()
+        else:
+            self.wake()
 
-    async def _run(self):
-        h = self.clock_handle
-        trig = RisingEdge(h) if self.edge == "posedge" else FallingEdge(h) if self.edge == "negedge" \
-            else ValueChange(h)
+    async def _relay(self):
         try:
-            while True:
-                await trig
-                self.tickno += 1
-                c, cx, H, R, RX = self.c, self.cx, self.H, self.R, self.RX
-                for i in range(len(c)):
-                    c[i] = None
-                for i in range(len(cx)):
-                    cx[i] = None
-                if self.iff_fn is not None and not self.iff_fn(c, R, cx, RX, H):
-                    continue
-                for k, (vfn, gfn, ring) in enumerate(self.channels):
-                    H[k] = ring[0]
-                    cur = vfn(c, R, cx, RX, H)
-                    if gfn is None or gfn(c, R, cx, RX, H):
-                        ring.append(cur)
-                t = self.tickno
-                for step in self.steps:
-                    step(c, R, cx, RX, H, t)
+            await self._err.wait()
+            raise self.error
         finally:
+            self._stop()
             for m in self.monitors:
                 m.group._task_ended()
 
+    def _arm(self):
+        if self._trig is None:
+            self._trig = {"posedge": RisingEdge, "negedge": FallingEdge}.get(self.edge, ValueChange)(
+                self.clock_handle)
+        self._cb = self._trig._register(self._on_clock)
+
+    def _stop(self):
+        self.stopped = True
+        if self._cb is not None:
+            self._cb.cancel()
+            self._cb = None
+        self._unwatch()
+        self.sleeping = False
+
+    def _on_clock(self):
+        if self.stopped:
+            self._cb = None
+            return
+        self._arm()                    # the fired callback is gone: arm the next edge
+        if self.sleeping:
+            self.skipped += 1
+            return
+        try:
+            if self._tick() and self.idle_sleep:
+                self._maybe_sleep()
+        except BaseException as e:     # noqa: B036 - relayed to the test
+            self.error = e
+            self._stop()
+            self._err.set()
+
+    def _tick(self) -> bool:
+        """Evaluate one clock edge; False if the clocking event's iff was false."""
+        self.tickno += 1
+        c, cx, H, R, RX = self.c, self.cx, self.H, self.R, self.RX
+        for i in range(len(c)):
+            c[i] = None
+        for i in range(len(cx)):
+            cx[i] = None
+        if self.iff_fn is not None and not self.iff_fn(c, R, cx, RX, H):
+            return False
+        for k, (vfn, gfn, ring) in enumerate(self.channels):
+            H[k] = ring[0]
+            cur = vfn(c, R, cx, RX, H)
+            if gfn is None or gfn(c, R, cx, RX, H):
+                ring.append(cur)
+        t = self.tickno
+        for step in self.steps:
+            step(c, R, cx, RX, H, t)
+        if self.removals:
+            for hd in self.removals:
+                self.detach(hd)
+            self.removals.clear()
+        return True
+
+    # -- idle sleep -----------------------------------------------------------
+    def _maybe_sleep(self):
+        mons = self.monitors
+        if mons:
+            i0 = self._last_busy if self._last_busy < len(mons) else 0
+            if not mons[i0].monitor.sleepable():
+                return
+            for i, h in enumerate(mons):
+                if not h.monitor.sleepable():
+                    self._last_busy = i
+                    return
+        for _, _, ring in self.channels:
+            if ring.count(ring[0]) != len(ring):
+                return
+        sl, xs = set(self.iff_slots[0]), set(self.iff_slots[1])
+        for h in mons:
+            a, b = h.monitor.idle_slots()
+            sl |= a
+            xs |= b
+        for a, b in self.channel_slots:
+            sl |= a
+            xs |= b
+        watch = {}
+        for s_ in sl:
+            hd = self.handles[s_]
+            if hd is None:
+                return                 # a Python value: changes cannot be observed
+            watch[id(hd._handle)] = hd
+        for x in xs:
+            hd = self.xhandles[x]
+            watch[id(hd._handle)] = hd
+        self.sleeping = True
+        self.sleeps += 1
+        self.skipped = 0
+        # Wake-up callbacks are never cancelled (cancelling value-change
+        # callbacks from inside one hangs some simulators). At most one is
+        # armed per signal; one left from an earlier sleep stays valid, and a
+        # wake-up that turns out unnecessary only costs one evaluated tick.
+        for key, hd in watch.items():
+            if key not in self._armed:
+                self._armed.add(key)
+                ValueChange(hd)._register(functools.partial(self._on_wake, key))
+
+    def _on_wake(self, key):
+        self._armed.discard(key)
+        if self.sleeping and not self.stopped:
+            self.wake()
+
+    def _unwatch(self):
+        pass                           # see _maybe_sleep: wake-ups are left armed
+
+    def wake(self):
+        """Leave idle sleep, applying the edges counted meanwhile."""
+        if not self.sleeping:
+            return
+        self.sleeping = False
+        self._unwatch()
+        k, self.skipped = self.skipped, 0
+        if k:
+            for h in self.monitors:
+                h.monitor.skip(k)
+            self.tickno += k
+            # the histories are steady: appending the same value changes nothing
+
 
 _domains: dict = {}
+IDLE_SLEEP = os.environ.get("COCOTBEXT_SVA_IDLE_SLEEP", "1") not in ("0", "", "false", "no")
 
 
 def _get_domain(clock_handle, edge_kind, iff_text, scope_key, label) -> _Domain:
@@ -363,7 +516,8 @@ class _Binder(Resolver):
 class AssertionHandle:
     """An assertion attached to a clocking domain (returned by assert_property & co.)."""
 
-    def __init__(self, group, name, prog, domain, severity, message, on_fail, on_pass):
+    def __init__(self, group, name, prog, domain, severity, message, on_fail, on_pass,
+                 initial: bool = False):
         self.group = group
         self.name = name
         self.prog = prog
@@ -375,13 +529,18 @@ class AssertionHandle:
         self.kind = prog.kind
         self.monitor = Monitor(prog, name, self, domain)
         self.enabled_any = True
-        self.step = self.monitor.tick_env if prog.envmode else self.monitor.tick
+        self.initial = initial
+        if initial:
+            self.step = self.monitor.tick_once
+        else:
+            self.step = self.monitor.tick_env if prog.envmode else self.monitor.tick
         self.wants_pass = on_pass is not None or prog.kind == "cover"
         self.wants_vacuous = False
         self.hits = 0
 
     @property
     def stats(self) -> dict:
+        self.domain.wake()          # apply ticks counted during idle sleep
         d = self.monitor.stats.as_dict()
         if self.kind == "cover":
             d = {"attempts": d["attempts"], "hits": d["passes"]}
@@ -501,31 +660,77 @@ class Assertions:
     def assert_property(self, prop, name: str | None = None, *, clock=None, disable_iff=...,
                         signals: dict | None = None, values: dict | None = None,
                         severity: str = "error", message: str | None = None,
-                        on_fail: Callable | None = None, on_pass: Callable | None = None) -> AssertionHandle:
+                        on_fail: Callable | None = None, on_pass: Callable | None = None,
+                        initial: bool = False) -> AssertionHandle:
         """Check a concurrent property on every clock tick (SV `assert property`).
 
         `values` maps names to Python callables sampled at the clock tick.
         `message` may reference signals in braces: "count={u_ctrl.count}".
+        With initial=True a single attempt starts at the next clock tick (SV: a
+        concurrent assertion in an initial block), e.g. for `always ...`.
         """
         return self._add("assert", prop, name, clock, disable_iff, signals, values, severity, message,
-                         on_fail, on_pass)
+                         on_fail, on_pass, initial)
 
     def assume_property(self, prop, name: str | None = None, **kw) -> AssertionHandle:
         """SV `assume property` (checked like an assertion in simulation)."""
         kw.setdefault("disable_iff", ...)
         return self._add("assume", prop, name, kw.pop("clock", None), kw.pop("disable_iff"),
                          kw.pop("signals", None), kw.pop("values", None), kw.pop("severity", "error"),
-                         kw.pop("message", None), kw.pop("on_fail", None), kw.pop("on_pass", None))
+                         kw.pop("message", None), kw.pop("on_fail", None), kw.pop("on_pass", None),
+                         kw.pop("initial", False))
 
     def cover_property(self, prop, name: str | None = None, *, clock=None, disable_iff=...,
                        signals: dict | None = None, values: dict | None = None,
-                       on_hit: Callable | None = None) -> AssertionHandle:
+                       on_hit: Callable | None = None, initial: bool = False) -> AssertionHandle:
         """Count matches of a property or sequence (SV `cover property`)."""
         return self._add("cover", prop, name, clock, disable_iff, signals, values, "info", None, None,
-                         on_hit)
+                         on_hit, initial)
+
+    async def expect(self, prop, name: str | None = None, *, clock=None, disable_iff=...,
+                     signals: dict | None = None, values: dict | None = None,
+                     severity: str = "error", message: str | None = None,
+                     timeout: int | None = None) -> bool:
+        """Wait for one evaluation of a property that starts at the next clock
+        tick (SV `expect`). Returns True when it holds; a failure is reported
+        like an assertion failure and returns False.
+
+        `timeout` (clock ticks) ends a still-pending evaluation with the
+        end-of-test rule: weak obligations hold, strong ones fail.
+        """
+        h = self._add("assert", prop, name or f"expect{self.root._count + 1}", clock, disable_iff,
+                      signals, values, severity, message, None, None, True)
+        h.kind = "expect"
+        mon = h.monitor
+        state = {"ticks": 0, "done": False}
+        step = h.step
+
+        def expect_step(c, R, cx, RX, H, t):
+            step(c, R, cx, RX, H, t)
+            state["ticks"] += 1
+            if not mon.pending():
+                pass
+            elif timeout is not None and state["ticks"] >= timeout:
+                mon.finish(t)
+            else:
+                return
+            h.domain.removals.append(h)
+            state["done"] = True
+
+        h.step = expect_step
+        h.domain.steps[h.domain.steps.index(step)] = expect_step
+        # The domain runs in raw simulator callbacks, outside the scheduler:
+        # poll on the clock edge instead of waiting on an Event.
+        dom = h.domain
+        trig = {"posedge": RisingEdge, "negedge": FallingEdge}.get(dom.edge, ValueChange)(dom.clock_handle)
+        while not state["done"]:
+            await trig
+            if dom.stopped:
+                break
+        return mon.n_failures == 0
 
     def _add(self, kind, prop, name, clock, disable_iff, signals, values, severity, message,
-             on_fail, on_pass):
+             on_fail, on_pass, initial=False):
         root = self.root
         if severity not in SEVERITIES:
             raise ValueError(f"severity must be one of {SEVERITIES}")
@@ -548,7 +753,7 @@ class Assertions:
         prog = compiler.compile(spec, kind, default_disable=dis)
         for w in prog.warnings:
             _log.warning("%s: %s", name, w)
-        h = AssertionHandle(root, name, prog, domain, severity, message, on_fail, on_pass)
+        h = AssertionHandle(root, name, prog, domain, severity, message, on_fail, on_pass, initial)
         h.enabled_any = True
         root.assertions.append(h)
         domain.monitors.append(h)
@@ -667,7 +872,9 @@ class Assertions:
         if iff is not None and d.iff_fn is None:
             binder = _Binder(self, d, overrides, {})
             ec = ExprCompiler(binder, iff_text)
-            d.iff_fn = gen_value_fn(ec.boolean(self._expand_lets(iff)))
+            code = ec.boolean(self._expand_lets(iff))
+            d.iff_fn = gen_value_fn(code)
+            d.iff_slots = (frozenset(code.slots), frozenset(code.xslots))
         return d
 
     # -- immediate assertions -----------------------------------------------
@@ -822,16 +1029,21 @@ class Assertions:
     def off(self, pattern: str = "*"):
         """Stop starting new attempts ($assertoff); attempts in flight complete."""
         for h in self._matching(self._full_pattern(pattern)):
+            h.domain.wake()
             h.monitor.enabled = False
 
     def on(self, pattern: str = "*"):
         """Resume starting attempts ($asserton)."""
         for h in self._matching(self._full_pattern(pattern)):
+            if h.initial and h.monitor.n_attempts:
+                continue            # its single attempt has started already
+            h.domain.wake()
             h.monitor.enabled = True
 
     def kill(self, pattern: str = "*"):
         """Abort attempts in flight and stop starting new ones ($assertkill)."""
         for h in self._matching(self._full_pattern(pattern)):
+            h.domain.wake()
             h.monitor.kill()
             h.monitor.enabled = False
 
@@ -861,9 +1073,8 @@ class Assertions:
         if root in _test_groups:
             _test_groups.remove(root)
         for h in root.assertions:
-            if h in h.domain.monitors:
-                h.domain.monitors.remove(h)
-                h.domain.steps.remove(h.step)
+            h.domain.wake()
+            h.domain.detach(h)
             h.monitor.finish(h.domain.tickno)
         root._log_summary()
         errors = root.errors
@@ -884,7 +1095,7 @@ class Assertions:
                 continue
             rows.append(f"  {h.name:<40} {h.kind:<7} attempts={st.attempts} pass={st.passes} "
                         f"vacuous={st.vacuous} fail={st.failures}" + (f" disabled={st.disabled}" if st.disabled else ""))
-            if st.passes == 0 and st.failures == 0 and st.attempts:
+            if st.passes == 0 and st.failures == 0 and st.vacuous:
                 never.append(h.name)
         for name, st in self.immediate_stats.items():
             if st["kind"] == "cover":
@@ -896,7 +1107,7 @@ class Assertions:
                f"{len(self.immediate_stats)} immediate, {nfail} failure(s)"
         _log.info("%s\n%s", head, "\n".join(rows))
         for name in never:
-            _log.warning("%s: never triggered (all attempts vacuous)", name)
+            _log.warning("%s: never triggered (only vacuous successes)", name)
 
     def _task_ended(self):
         if not self._finalized and not self._unchecked_warned and self.errors:

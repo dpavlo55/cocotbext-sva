@@ -5,6 +5,7 @@ module bench #(parameter int N_LFSR = 64) (input logic clk);
   logic req_d1 = 1'b0;
   logic ack    /*verilator public_flat_rd*/ = 1'b0;
   logic         s1   /*verilator public_flat_rd*/;
+  logic         rare /*verilator public_flat_rd*/;  // 1 on ~1/256 of cycles (idle workload)
   logic [7:0]   s8   /*verilator public_flat_rd*/;
   logic [31:0]  s32  /*verilator public_flat_rd*/;
   logic [63:0]  s64  /*verilator public_flat_rd*/;
@@ -23,6 +24,7 @@ module bench #(parameter int N_LFSR = 64) (input logic clk);
   end
 
   assign s1   = lfsr[0][0];
+  assign rare = (lfsr[9][7:0] == 8'h5A);
   assign s8   = lfsr[0][7:0];
   assign s32  = lfsr[1];
   assign s64  = {lfsr[2], lfsr[3]};

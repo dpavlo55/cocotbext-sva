@@ -28,6 +28,7 @@ architecture rtl of bench is
   signal lfsr : lfsr_array(0 to N_LFSR - 1) := init_lfsrs;
   signal req, req_d1, ack : std_logic := '0';
   signal s1   : std_logic;
+  signal rare : std_logic;                       -- 1 on ~1/256 of cycles (idle workload)
   signal s8   : std_logic_vector(7 downto 0);
   signal s32  : std_logic_vector(31 downto 0);
   signal s64  : std_logic_vector(63 downto 0);
@@ -53,6 +54,7 @@ begin
   end process;
 
   s1   <= lfsr(0)(0);
+  rare <= '1' when lfsr(9)(7 downto 0) = x"5A" else '0';
   s8   <= lfsr(0)(7 downto 0);
   s32  <= lfsr(1);
   s64  <= lfsr(2) & lfsr(3);
