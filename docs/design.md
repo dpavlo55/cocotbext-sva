@@ -141,15 +141,33 @@ Always-read signals: operands of `$past` / `$rose` / `$fell` / `$stable` /
 largest `$past` depth. `disable iff` operands are read only when the assertion
 is not idle.
 
-### 5.5 Idle sleep (phase 2)
+### 5.5 Clock loop and idle sleep (phase 2)
 
 Phase 0 showed the per-cycle Python wake (3–7 µs) is the dominant fixed cost
 once the engine itself is fast, so this moved forward from phase 3.
 
-When every assertion on a clocking event is idle, stop awaiting the clock and
-await value changes of the signals the idle states depend on (plus history
-signals). No change event means the value stayed constant, so history stays
-valid. Enabled only after the reference-model fuzzing (§10) passes on it.
+**Clock loop.** Each clocking domain is a callback registered on cocotb's
+edge trigger of the clock and re-armed at every edge, not a task awaiting the
+trigger: no task resume per tick. Trigger callbacks run before the tasks the
+same edge resumes, so a test writing a signal at the edge never affects the
+values sampled (a raw GPI callback does not have this guarantee: on Icarus it
+ran after the test's writes). Exceptions raised in the loop (fatal severity,
+user callbacks) go to a small relay task that re-raises them in the test.
+
+**Idle sleep.** After a tick where every assertion of the domain is idle —
+nothing in flight, and the next ticks would only increment counters (no
+failure, no pass callback, no cover hit) — and every `$past` history is
+steady (all entries equal), the clock callback only counts edges. Value-change
+callbacks on every signal the idle states read (plus history operands and the
+clocking `iff`) wake the domain; the counted edges are then applied exactly to
+the attempt / vacuity / pass counters and the tick number. Python-valued
+inputs (`values=`) cannot be watched and prevent sleep. Control calls
+(`on`/`off`/`kill`), new assertions, `stats()` and `finalize()` wake the
+domain first. Wake-up callbacks are never cancelled (cancelling value-change
+callbacks from inside one hangs a commercial simulator): at most one is armed
+per signal, and a stale one costs one evaluated tick. Verified by an
+end-to-end test comparing a sleeping and a non-sleeping domain on the same
+clock (identical failures and counters) on every simulator.
 
 ## 6. Sampling semantics
 
@@ -244,7 +262,7 @@ Named / parameterized sequences and properties; `let` as a macro.
 functions (`$past_gclk` …), recursive properties, multi-clock sequences
 (phase 4).
 
-## 9. Semantic decisions (settled in phase 1)
+## 9. Semantic decisions (settled in phases 1 and 2)
 
 Settled by the golden corpus (behaviour of a mature SVA implementation) where
 the LRM leaves room, otherwise by the LRM:
@@ -255,16 +273,25 @@ the LRM leaves room, otherwise by the LRM:
 | Vacuity | Property of the evaluation (16.14.8): failures can be vacuous too. `or`/`iff` decide once truth and vacuity are known; vacuity of a pending evaluation can be known early (an implication whose antecedent matched) |
 | `implies` | Vacuous when the left side is false |
 | `#-#`, `#=#` | Existential dual of implication; an antecedent that can still match at the end of the test is not a failure |
-| End of test | Pending weak obligations pass silently, strong ones fail; a `|=>` consequent that has not seen a tick is not evaluated |
+| End of test | Pending weak obligations pass silently, strong ones fail; a `|=>` consequent that has not seen a tick fails only if it is a strong obligation (`s_nexttime`, `s_always`, `s_eventually`, `s_until`, strong sequence); a negation or `#-#` there never fails |
+| Strong operators | `s_nexttime`, `s_always`, `s_eventually`, `s_until(_with)` make the default strength of their operands strong |
+| `|=>` with an empty antecedent match | The match ends at the start tick: the consequent starts at the next tick (and the attempt is nonvacuous). Empty matches of a `|->` antecedent are ignored |
+| `always`, `eventually` | A new evaluation of the operand starts at every tick of the range. Successes are never vacuous; one vacuous success of the operand decides `eventually` |
+| `until` family | P until Q: Q at some tick k, P at every tick before k (`_with`: up to and including k); weak forms also hold if P always holds. General properties as operands |
+| `accept_on`, `reject_on` | Checked at clock ticks (sync and async forms alike), the first tick of the evaluation included. A true condition decides the attempt at that tick (accept: success, reject: failure) whatever the operand's verdict there, except that a vacuous success stays vacuous |
+| Single-attempt assertions | `initial=True`: one attempt at the first tick; pending strong obligations are reported at the end like any other |
 | Sequence `and` | Empty matches of an operand do not take part |
 | Contradictions | A transition whose conditions require the same expression true and false is dropped at build time (the attempt fails one tick earlier than the formal truncated-path semantics) |
 | `$past` before history | Value at the time the assertion was created (the "default sampled value") |
 | `disable iff` | Evaluated at clock ticks; disabled attempts produce no verdict |
+| Expressions | `a -> b` is `!a || b`, `a <-> b` is `!a == !b` |
 | `cover` | Counts nonvacuous matches; non-matching attempts are not errors |
 
 Known differences from the reference implementation are listed with reasons
-in `tests/test_corpus.py` (one is a reference-tool quirk with `if/else`; one is
-contradiction detection across different expressions).
+in `tests/test_corpus.py`. In every one of them the engine agrees with the
+reference interpreter (formal semantics plus the decisions above), or the
+difference comes from contradiction pruning; see `phase2-results.md` for the
+classes.
 
 ## 10. Verification strategy
 
@@ -329,6 +356,7 @@ assertion per cycle.
 
 0. **Calibration and benchmarks** — done, see `phase0-results.md`.
    Phase 1 — done, see `phase1-results.md`.
+   Phase 2 — done, see `phase2-results.md`.
 1. **Core:** parser + IR, NFA + lazy DFA, `EdgeSampler` with demand-driven
    reads, immediate + deferred assertions, sampled-value functions, all
    sequence operators, implications, `disable iff`, clocking events with `iff`,
