@@ -62,6 +62,11 @@ class Monitor:
         self.n_attempts = self.n_passes = self.n_vacuous = self.n_failures = 0
         self.n_disabled = self.n_pending_fail = 0
         self.enabled = True           # $asserton/$assertoff: start new attempts?
+        # Idle tracking (for idle sleep): after a tick with nothing in flight
+        # before and after it, idle_v is that tick's outcome (None: no attempt
+        # started, else -verdict of the attempt that resolved at once);
+        # 1 means not idle.
+        self.idle_v = 1
         self._start_bit = prog.start_bit
         self._sink_vac = getattr(sink, "wants_vacuous", False)
         self.tmpl = prog.tmpl
@@ -169,17 +174,22 @@ class Monitor:
         if not moves:
             # nothing in flight before this tick (the common, idle case)
             if new == -2:                      # new attempt vacuous at once
+                self.idle_v = -2
                 self.n_vacuous += 1
                 if self._sink_vac:
                     self.sink(VPASS, self, 1, ((tickno, self.domain.now()),), tickno)
                 return
             if new is None:
+                self.idle_v = None
                 return
             if new < 0:
+                self.idle_v = new
                 self._verdict(-new, None, tickno)
                 return
+            self.idle_v = 1
             self.meta = [(1, ((tickno, self.domain.now()),))]
             return
+        self.idle_v = 1
         old = self.meta
         if perm is not None:
             for i, v in verdicts:
@@ -244,6 +254,7 @@ class Monitor:
         toks = self.tokens
         start = self.enabled
         if not toks and not start:
+            self.idle_v = None
             return
         if start:
             self.n_attempts += 1
@@ -252,6 +263,7 @@ class Monitor:
             for t, m in toks.items():
                 self._verdict(DISABLED, m, tickno)
             self.tokens = {}
+            self.idle_v = (-DISABLED if start else None) if not toks else 1
             if start:
                 self._verdict(DISABLED, None, tickno)
             return
@@ -262,6 +274,7 @@ class Monitor:
         items = list(toks.items())
         if start:
             items.append((self._init_term, None))
+        iv = None
         for t, m in items:
             v, t2 = step(t, val)
             if v is None:
@@ -269,8 +282,55 @@ class Monitor:
                     m = (1, ((tickno, self.domain.now()),))
                 nxt[t2] = _merge(nxt.get(t2), m)
             else:
+                if m is None:
+                    iv = -v
                 self._verdict(v, m, tickno)
         self.tokens = nxt
+        self.idle_v = iv if not toks and not nxt else 1
+
+    # -- single attempt (SV: concurrent assertion in an initial block) --------
+    def tick_once(self, c, R, cx, RX, H, tickno):
+        """Like tick/tick_env, but only the first tick starts an attempt."""
+        if self.prog.envmode:
+            self.tick_env(c, R, cx, RX, H, tickno)
+        else:
+            self.tick(c, R, cx, RX, H, tickno)
+        self.enabled = False
+        if self.idle_v != 1:
+            self.idle_v = None        # later ticks start nothing
+
+    # -- idle sleep ---------------------------------------------------------
+    def sleepable(self) -> bool:
+        """Idle, and k more identical ticks can be accounted for without
+        evaluating them (no report or callback is due on such a tick)."""
+        v = self.idle_v
+        if v is None:
+            return True
+        if v == -VPASS:
+            return not self._sink_vac
+        if v == -PASS:
+            return not (self.prog.kind == "cover" or self.sink.wants_pass)
+        if v == -FAIL or v == -VFAIL:
+            return self.prog.kind == "cover"   # a non-matching cover attempt is silent
+        return v == -DISABLED
+
+    def idle_slots(self):
+        """(slots, xslots) the idle state reads each tick."""
+        if self.prog.envmode:
+            return self.prog.all_slots()
+        return self.prog.slots_of(self.gs.need)
+
+    def skip(self, k: int):
+        """Account for k idle ticks identical to the last one."""
+        if self.enabled:
+            self.n_attempts += k
+        v = self.idle_v
+        if v == -VPASS:
+            self.n_vacuous += k
+        elif v == -PASS:
+            self.n_passes += k
+        elif v == -DISABLED:
+            self.n_disabled += k
 
     # -- end of test --------------------------------------------------------
     def pending(self):

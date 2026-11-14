@@ -22,7 +22,8 @@ from ._errors import SvaError, SvaNameError, SvaUnsupportedError
 from ._expr import (HELPERS, Code, ConstRef, ExprCompiler, LocalRef, Resolver, SignalRef,
                     TriggeredRef, mask, walk)
 from ._nfa import Builder
-from ._prop import VPASS, AndT, ConstT, FollowedByT, IffT, IfT, ImpliesT, ImplT, NotT, OrT, SeqT
+from ._prop import (FAIL, VPASS, AbortT, AlwaysT, AndT, ConstT, EventuallyT, FollowedByT, IffT, IfT,
+                    ImpliesT, ImplT, NextT, NotT, OrT, SeqT, UntilT)
 
 
 @dataclass
@@ -52,6 +53,7 @@ class Program:
     warnings: list = field(default_factory=list)
     contradiction: bool = False           # some transition was dropped as unsatisfiable
     _bitsfn_cache: dict = field(default_factory=dict, repr=False)
+    _slots_cache: dict = field(default_factory=dict, repr=False)
     _envfns: list = field(default_factory=list, repr=False)
     _actfns: list = field(default_factory=list, repr=False)
 
@@ -63,6 +65,28 @@ class Program:
             fn = _gen_bits_fn([self.atoms[i] for i in idx], idx)
             self._bitsfn_cache[m] = fn
         return fn
+
+    def slots_of(self, m: int):
+        """(value slots, X slots) read by the base atoms in mask m."""
+        hit = self._slots_cache.get(m)
+        if hit is None:
+            sl, xs = set(), set()
+            for i, code in enumerate(self.atoms):
+                if m >> i & 1:
+                    sl |= code.slots
+                    xs |= code.xslots
+            hit = self._slots_cache[m] = (frozenset(sl), frozenset(xs))
+        return hit
+
+    def all_slots(self):
+        hit = self._slots_cache.get("all")
+        if hit is None:
+            sl, xs = set(), set()
+            for code in self.atoms + self.env_atoms + [c for c, _ in self.actions]:
+                sl |= code.slots
+                xs |= code.xslots
+            hit = self._slots_cache["all"] = (frozenset(sl), frozenset(xs))
+        return hit
 
     def env_fns(self):
         if not self._envfns and self.env_atoms:
@@ -309,6 +333,11 @@ class Compiler:
             if node.op == "iff":
                 p, q = node.left, node.right
                 return IffT(self.prop(p, strength), self.prop(q, strength))
+            if node.op in ("until", "s_until", "until_with", "s_until_with"):
+                strong = node.op.startswith("s_")
+                st = "strong" if strong else strength
+                return UntilT(self.prop(node.left, st), self.prop(node.right, st),
+                              node.op.endswith("_with"), strong, env)
             raise SvaUnsupportedError(self._at(f"'{node.op}' is not supported yet", node))
         if isinstance(node, A.PIf):
             g = self.ctx.guard(node.cond)
@@ -321,9 +350,47 @@ class Compiler:
             return IfT(g, p, q, env)
         if isinstance(node, A.PCase):
             return self._case(node, strength)
-        if isinstance(node, (A.PUnaryTemporal, A.PAbort)):
-            raise SvaUnsupportedError(self._at(f"'{node.op}' is not supported yet", node))
+        if isinstance(node, A.PUnaryTemporal):
+            return self._temporal(node, strength)
+        if isinstance(node, A.PAbort):
+            g = self.ctx.guard(node.cond)
+            if g is not True and g is not False and g[2]:
+                raise SvaError(self._at(f"the condition of {node.op} cannot use local variables", node.cond))
+            p = self.prop(node.prop, strength)
+            accept = node.op.endswith("accept_on")
+            if g is False:
+                return p
+            if g is True:
+                g = (0, 0, ())          # always true (a vacuous success still stays vacuous)
+            return AbortT(g, p, accept)
         raise SvaUnsupportedError(self._at("unsupported property", node))
+
+    def _temporal(self, node: A.PUnaryTemporal, strength):
+        op = node.op
+        strong = op.startswith("s_")
+        base = op[2:] if strong else op
+        # a strong operator makes the default strength of its operand strong
+        p = self.prop(node.prop, "strong" if strong else strength)
+        env = self.envmode
+        if base == "nexttime":
+            n = 1 if node.lo is None else self._count(node.lo)
+            return p if n == 0 else NextT(p, n, strong, env)
+        if node.lo is None:
+            if base == "eventually" and not strong:
+                raise SvaError(self._at("'eventually' needs a range: eventually [m:n] (or use s_eventually)", node))
+            if base == "always" and strong:
+                raise SvaError(self._at("'s_always' needs a bounded range: s_always [m:n]", node))
+            lo, hi = 0, None
+        else:
+            lo = self._count(node.lo)
+            hi = None if node.hi_inf else self._count(node.hi)
+            if hi is not None and hi < lo:
+                raise SvaError(self._at("range must have lo <= hi", node))
+            if hi is None and (base == "always") == strong:
+                raise SvaError(self._at(f"'{op}' needs a bounded range", node))
+        if base == "always":
+            return AlwaysT(p, lo, hi, strong, env)
+        return EventuallyT(p, lo, hi, strong, env)
 
     def _case(self, node: A.PCase, strength):
         default = None

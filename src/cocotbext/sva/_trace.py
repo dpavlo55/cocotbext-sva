@@ -106,8 +106,11 @@ class _Domain:
 
 def run_trace(assertions: dict, signals: dict, rows: list, params: dict | None = None,
               named: dict | None = None, kinds: dict | None = None, initial: dict | None = None,
-              finish: bool = True) -> TraceResult:
-    """Evaluate assertions {name: text} on rows. Ticks are numbered from 0."""
+              finish: bool = True, once=()) -> TraceResult:
+    """Evaluate assertions {name: text} on rows. Ticks are numbered from 0.
+
+    Assertions named in `once` start a single attempt at the first tick (SV:
+    a concurrent assertion in an initial block)."""
     binder = TraceBinder(signals, params)
     named_defs = {}
     for n, d in (named or {}).items():
@@ -153,7 +156,9 @@ def run_trace(assertions: dict, signals: dict, rows: list, params: dict | None =
             if gfn is None or gfn(c, R, cx, RX, H):
                 hist[k].append(cur)
         for m in mons:
-            if m.prog.envmode:
+            if m.name in once:
+                m.tick_once(c, R, cx, RX, H, t)
+            elif m.prog.envmode:
                 m.tick_env(c, R, cx, RX, H, t)
             else:
                 m.tick(c, R, cx, RX, H, t)

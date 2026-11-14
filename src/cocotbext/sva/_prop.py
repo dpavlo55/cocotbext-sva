@@ -41,6 +41,18 @@ class _Unstarted:
         return f"Unstarted({self.t!r})"
 
 
+class _Pre(_Unstarted):
+    """A |=> / #=# consequent from an empty antecedent match: it becomes
+    _Unstarted after the start tick, so its first tick is the next one."""
+    __slots__ = ()
+
+    def __eq__(self, other):
+        return type(other) is _Pre and other.t == self.t
+
+    def __hash__(self):
+        return hash(("#PRE", self.t))
+
+
 class Val:
     """Valuation of one tick: base-atom bits plus (env mode) a context that
     evaluates env atoms and assignment actions."""
@@ -88,6 +100,12 @@ class Template:
         """True if this pending evaluation is already known to be nonvacuous."""
         return False
 
+    def fin0(self) -> bool:
+        """End-of-test truth of an evaluation that has not seen any tick (the
+        consequent of |=> spawned at the last tick): only strong obligations
+        fail."""
+        return True
+
 
 class SeqT(Template):
     """A sequence used as a property: passes at its first match."""
@@ -122,6 +140,9 @@ class SeqT(Template):
     def finish(self, term):
         return not self.strong
 
+    def fin0(self):
+        return not self.strong
+
     def nv(self, term):
         return True
 
@@ -145,6 +166,10 @@ class ImplT(Template):
             a = frozenset((q, env) for q in self.ante.init)
         else:
             a = self.ante.init
+        if not self.overlap and self.ante.nullable:
+            # an empty match of the antecedent of |=> ends at the start tick:
+            # the consequent starts at the next tick (reference behaviour)
+            return (a, True, False, frozenset((_Pre(self.cons.init(env)),)))
         return (a, False, False, _EMPTY)
 
     def step(self, term, val):
@@ -152,6 +177,9 @@ class ImplT(Template):
         cons = self.cons
         newc = set()
         for c in C:
+            if type(c) is _Pre:
+                newc.add(_Unstarted(c.t))
+                continue
             if type(c) is _Unstarted:
                 c = c.t
             v, c2 = cons.step(c, val)
@@ -196,18 +224,19 @@ class ImplT(Template):
         for c in C:
             if type(c) is _Unstarted:
                 m |= self.cons.init_need
-            else:
+            elif type(c) is not _Pre:
                 m |= self.cons.needs(c)
         return m
 
     def finish(self, term):
-        return all(self.cons.finish(c) for c in term[3] if type(c) is not _Unstarted)
+        cons = self.cons
+        return all(cons.fin0() if isinstance(c, _Unstarted) else cons.finish(c) for c in term[3])
 
     def nv(self, term):
         A, matched, nonvac, C = term
         if nonvac:
             return True
-        return any(self.cons.nv(c.t if type(c) is _Unstarted else c) for c in C)
+        return any(self.cons.nv(c.t if isinstance(c, _Unstarted) else c) for c in C)
 
 
 class NotT(Template):
@@ -305,6 +334,9 @@ class AndT(Template):
     def nv(self, term):
         return _side_nv(self.p, term[0]) or _side_nv(self.q, term[1])
 
+    def fin0(self):
+        return self.p.fin0() and self.q.fin0()
+
 
 class OrT(Template):
     """P or Q: a nonvacuous success of either side decides at once. Otherwise
@@ -340,6 +372,9 @@ class OrT(Template):
 
     def nv(self, term):
         return _side_nv(self.p, term[0]) or _side_nv(self.q, term[1])
+
+    def fin0(self):
+        return self.p.fin0() or self.q.fin0()
 
     def needs(self, term):
         m = 0
@@ -450,6 +485,8 @@ class FollowedByT(Template):
 
     def init(self, env):
         a = frozenset((q, env) for q in self.ante.init) if self.envmode else self.ante.init
+        if not self.overlap and self.ante.nullable:
+            return (a, frozenset((_Pre(self.cons.init(env)),)))
         return (a, _EMPTY)
 
     def step(self, term, val):
@@ -458,6 +495,9 @@ class FollowedByT(Template):
         newc = set()
         vac = False
         for c in C:
+            if type(c) is _Pre:
+                newc.add(_Unstarted(c.t))
+                continue
             if type(c) is _Unstarted:
                 c = c.t
             v, c2 = cons.step(c, val)
@@ -503,16 +543,16 @@ class FollowedByT(Template):
         for c in C:
             if type(c) is _Unstarted:
                 m |= self.cons.init_need
-            else:
+            elif type(c) is not _Pre:
                 m |= self.cons.needs(c)
         return m
 
     def finish(self, term):
         A, C = term
-        return bool(A) or any(type(c) is _Unstarted or self.cons.finish(c) for c in C)
+        return bool(A) or any(isinstance(c, _Unstarted) or self.cons.finish(c) for c in C)
 
     def nv(self, term):
-        return any(self.cons.nv(c.t if type(c) is _Unstarted else c) for c in term[1])
+        return any(self.cons.nv(c.t if isinstance(c, _Unstarted) else c) for c in term[1])
 
 
 class IfT(Template):
@@ -579,3 +619,318 @@ class ConstT(Template):
 
     def finish(self, term):
         return self.verdict != FAIL
+
+    def fin0(self):
+        return self.verdict != FAIL
+
+
+# --------------------------------------------------------------------------
+# Temporal property operators (IEEE 1800 16.12.10 - 16.12.14)
+# --------------------------------------------------------------------------
+
+def _adv(tmpl, t, val):
+    if _is_done(t):
+        return t
+    v, t2 = tmpl.step(t, val)
+    return t2 if v is None else _DONE[v]
+
+
+def _true_done(t):
+    return t is _DONE_P or t is _DONE_V
+
+
+def _false_done(t):
+    return t is _DONE_F or t is _DONE_VF
+
+
+class NextT(Template):
+    """nexttime[n] P / s_nexttime[n] P (n >= 1): P is evaluated from the n-th
+    next tick. Term: ("N", k, env) while k more ticks are skipped before P
+    starts, then ("P", term of P)."""
+
+    def __init__(self, p: Template, n: int, strong: bool, envmode: bool):
+        self.p, self.n, self.strong = p, n, strong
+        self.envmode = envmode
+        self.init_need = 0
+
+    def init(self, env):
+        return ("N", self.n, env)
+
+    def step(self, term, val):
+        if term[0] == "N":
+            if term[1] > 0:
+                return None, ("N", term[1] - 1, term[2])
+            t = self.p.init(term[2])
+        else:
+            t = term[1]
+        v, t2 = self.p.step(t, val)
+        if v is not None:
+            return v, None
+        return None, ("P", t2)
+
+    def needs(self, term):
+        if term[0] == "N":
+            return self.p.init_need if term[1] == 0 else 0
+        return self.p.needs(term[1])
+
+    def finish(self, term):
+        if term[0] == "N":
+            return not self.strong
+        return self.p.finish(term[1])
+
+    def nv(self, term):
+        return term[0] == "P" and self.p.nv(term[1])
+
+    def fin0(self):
+        return not self.strong
+
+
+class AlwaysT(Template):
+    """always [lo:hi] P / s_always [lo:hi] P (hi None means $, weak form only).
+
+    A new evaluation of P starts at every tick of the range; all must hold.
+    Term: (k, nonvac, instances, env), k = ticks consumed (saturated at lo when
+    the range is unbounded, so the term space stays finite)."""
+
+    def __init__(self, p: Template, lo: int, hi, strong: bool, envmode: bool):
+        self.p, self.lo, self.hi, self.strong = p, lo, hi, strong
+        self.envmode = envmode
+        self.init_need = p.init_need if lo == 0 else 0
+
+    def init(self, env):
+        return (0, False, _EMPTY, env)
+
+    def _in_range(self, k):
+        return k >= self.lo and (self.hi is None or k <= self.hi)
+
+    def step(self, term, val):
+        k, nonvac, insts, env = term
+        p = self.p
+        live = set()
+        todo = list(insts)
+        if self._in_range(k):
+            todo.append(p.init(env))
+        for t in todo:
+            v, t2 = p.step(t, val)
+            if v is None:
+                live.add(t2)
+            elif v == FAIL or v == VFAIL:
+                return v, None
+            elif v == PASS:
+                nonvac = True
+        if self.hi is not None and k >= self.hi and not live:
+            return PASS, None       # reference: never vacuous
+        k2 = k + 1 if (self.hi is not None or k < self.lo) else k
+        return None, (k2, nonvac, frozenset(live), env)
+
+    def needs(self, term):
+        k, _, insts, _ = term
+        m = self.p.init_need if self._in_range(k) else 0
+        for t in insts:
+            m |= self.p.needs(t)
+        return m
+
+    def finish(self, term):
+        k, _, insts, _ = term
+        if self.strong and self.hi is not None and k <= self.hi:
+            return False
+        return all(self.p.finish(t) for t in insts)
+
+    def nv(self, term):
+        return True                 # reference: always/eventually are never vacuous
+
+    def fin0(self):
+        return not self.strong
+
+
+class EventuallyT(Template):
+    """eventually [lo:hi] P (bounded, weak) / s_eventually [lo:hi] P (hi None
+    means $): a new evaluation of P starts at every tick of the range; one
+    must hold. Term: (k, instances, env)."""
+
+    def __init__(self, p: Template, lo: int, hi, strong: bool, envmode: bool):
+        self.p, self.lo, self.hi, self.strong = p, lo, hi, strong
+        self.envmode = envmode
+        self.init_need = p.init_need if lo == 0 else 0
+
+    def init(self, env):
+        return (0, False, _EMPTY, env)
+
+    _in_range = AlwaysT._in_range
+
+    def step(self, term, val):
+        k, vac, insts, env = term
+        p = self.p
+        live = set()
+        todo = list(insts)
+        if self._in_range(k):
+            todo.append(p.init(env))
+        for t in todo:
+            v, t2 = p.step(t, val)
+            if v is None:
+                live.add(t2)
+            elif v == PASS or v == VPASS:
+                return PASS, None   # reference: any success decides, never vacuous
+        if self.hi is not None and k >= self.hi and not live:
+            return FAIL, None
+        k2 = k + 1 if (self.hi is not None or k < self.lo) else k
+        return None, (k2, vac, frozenset(live), env)
+
+    def needs(self, term):
+        k, _, insts, _ = term
+        m = self.p.init_need if self._in_range(k) else 0
+        for t in insts:
+            m |= self.p.needs(t)
+        return m
+
+    def finish(self, term):
+        k, vac, insts, _ = term
+        if vac or any(self.p.finish(t) for t in insts):
+            return True
+        if self.hi is None or k <= self.hi:
+            return not self.strong
+        return False
+
+    def nv(self, term):
+        return True
+
+    def fin0(self):
+        return not self.strong
+
+
+class UntilT(Template):
+    """P until Q, P s_until Q, P until_with Q, P s_until_with Q.
+
+    Holds if Q holds at some tick k and P holds at every tick before k (until)
+    or up to and including k (until_with); the weak forms also hold if P
+    holds at every tick. P and Q are general properties, so an evaluation of
+    each starts at every tick until the outcome is known.
+
+    Term: (closed, entries, nonvac, env). entries[j] = [P term, Q term] of the
+    j-th tick still relevant (done markers once resolved). `closed`: no more
+    ticks are needed (a P failed, or a candidate Q matched)."""
+
+    def __init__(self, p: Template, q: Template, with_: bool, strong: bool, envmode: bool):
+        self.p, self.q, self.with_, self.strong = p, q, with_, strong
+        self.envmode = envmode
+        self.init_need = p.init_need | q.init_need
+
+    def init(self, env):
+        return (False, (), False, env)
+
+    def _req(self, k):
+        """Number of leading entries whose P candidate k requires."""
+        return k + 1 if self.with_ else k
+
+    def _alive(self, ents, k):
+        return not _false_done(ents[k][1]) and not any(_false_done(pt) for pt, _ in ents[:self._req(k)])
+
+    def step(self, term, val):
+        closed, entries, nonvac, env = term
+        p, q = self.p, self.q
+        ents = [[_adv(p, pt, val), _adv(q, qt, val)] for pt, qt in entries]
+        if not closed:
+            ents.append([_adv(p, p.init(env), val), _adv(q, q.init(env), val)])
+        # a failed P kills every candidate that requires it; no more ticks needed
+        for j, (pt, _) in enumerate(ents):
+            if _false_done(pt):
+                closed = True
+                del ents[(j if self.with_ else j + 1):]
+                break
+        for k in range(len(ents)):
+            if not self._alive(ents, k) or not _true_done(ents[k][1]):
+                continue
+            req = ents[:self._req(k)]
+            if all(_true_done(pt) for pt, _ in req):
+                nv = nonvac or ents[k][1] is _DONE_P or any(pt is _DONE_P for pt, _ in req)
+                return (PASS if nv else VPASS), None
+            # Q matched, some required P pending: later candidates are dominated
+            closed = True
+            del ents[k + 1:]
+            if not self.with_ and not _is_done(ents[k][0]):
+                ents[k][0] = _DONE_V        # not required by this candidate
+            break
+        if closed and not any(self._alive(ents, k) for k in range(len(ents))):
+            return FAIL, None
+        # leading entries whose P held and whose Q failed no longer matter
+        while ents and _true_done(ents[0][0]) and _false_done(ents[0][1]):
+            nonvac = nonvac or ents[0][0] is _DONE_P
+            del ents[0]
+        return None, (closed, tuple(map(tuple, ents)), nonvac, env)
+
+    def needs(self, term):
+        closed, entries, _, _ = term
+        m = 0 if closed else self.init_need
+        for pt, qt in entries:
+            if not _is_done(pt):
+                m |= self.p.needs(pt)
+            if not _is_done(qt):
+                m |= self.q.needs(qt)
+        return m
+
+    @staticmethod
+    def _ftruth(tmpl, t):
+        return _true_done(t) if _is_done(t) else tmpl.finish(t)
+
+    def finish(self, term):
+        closed, entries, _, _ = term
+        for k, (_, qt) in enumerate(entries):
+            if self._ftruth(self.q, qt) and all(self._ftruth(self.p, pt)
+                                                for pt, _ in entries[:self._req(k)]):
+                return True
+        if self.strong or closed:
+            return False
+        return all(self._ftruth(self.p, pt) for pt, _ in entries)
+
+    def fin0(self):
+        return not self.strong
+
+    def nv(self, term):
+        closed, entries, nonvac, _ = term
+        if nonvac:
+            return True
+        for pt, qt in entries:
+            if pt is _DONE_P or qt is _DONE_P:
+                return True
+            if not _is_done(pt) and self.p.nv(pt):
+                return True
+            if not _is_done(qt) and self.q.nv(qt):
+                return True
+        return False
+
+
+class AbortT(Template):
+    """accept_on / reject_on and their sync_ forms (identical on sampled ticks).
+
+    The condition is checked at every tick of the evaluation, the first one
+    included. When it is true the evaluation ends with a success (accept) or a
+    failure (reject), whatever the operand's own verdict at that tick, except
+    that a vacuous success of the operand stays vacuous (reference
+    behaviour)."""
+
+    def __init__(self, guard, p: Template, accept: bool):
+        self.guard, self.p, self.accept = guard, p, accept
+        self.envmode = p.envmode
+        self.gmask = guard[0] | guard[1]
+        self.init_need = self.gmask | p.init_need
+
+    def init(self, env):
+        return self.p.init(env)
+
+    def step(self, term, val):
+        v, t2 = self.p.step(term, val)
+        if v != VPASS and guard_true(self.guard, val, None):
+            return (PASS if self.accept else FAIL), None
+        return v, t2
+
+    def needs(self, term):
+        return self.gmask | self.p.needs(term)
+
+    def finish(self, term):
+        return self.p.finish(term)
+
+    def fin0(self):
+        return self.p.fin0()
+
+    def nv(self, term):
+        return self.p.nv(term)

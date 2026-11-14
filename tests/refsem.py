@@ -28,6 +28,8 @@ PASS_ANY = "pass_any"      # success whose vacuity the reference does not model
 
 sys.setrecursionlimit(10000)
 
+_UNTIL = ("until", "s_until", "until_with", "s_until_with")
+
 
 def _swap(letter):
     return BOT if letter is TOP else TOP if letter is BOT else letter
@@ -88,7 +90,7 @@ def holds_bool(expr, letter, env):
 
 
 class Ref:
-    def __init__(self, text, rows, tail_len=40):
+    def __init__(self, text, rows, tail_len=70):
         self.spec = parse_assertion(text)
         self.rows = rows
         self.tail_len = tail_len
@@ -244,9 +246,25 @@ class Ref:
                 return self.H(self._once(p, lambda: A.PNot(A.PImpl(op, p.seq, A.PNot(p.prop)))), i, env, w)
             shift = 0 if p.op == "|->" else 1
             for k, e in self.M(p.seq, i, env, w.swapped()):
+                if k < i and shift:
+                    k = i                   # empty match of a |=> antecedent
                 if k >= i and not self.H(p.prop, k + shift, e, w):
                     return False
             return True
+        if isinstance(p, A.PUnaryTemporal):
+            return self._H_temporal(p, i, env, w)
+        if isinstance(p, A.PAbort):
+            return self.H(p.prop, i, env, self._abort_word(p, i, env, w))
+        if isinstance(p, A.PBin) and p.op in _UNTIL:
+            strong, with_ = p.op.startswith("s_"), p.op.endswith("_with")
+            last = self._last(w, i)
+            for k in range(i, last + 1):
+                if self.H(p.right, k, env, w) and all(self.H(p.left, j, env, w)
+                                                      for j in range(i, k + (1 if with_ else 0))):
+                    return True
+            if strong:
+                return False
+            return all(self.H(p.left, j, env, w) for j in range(i, last + 1))
         if isinstance(p, A.PBin):
             if p.op == "and":
                 return self.H(p.left, i, env, w) and self.H(p.right, i, env, w)
@@ -266,6 +284,63 @@ class Ref:
                 return A.PBin("and", then, other)
             return self.H(self._once(p, build), i, env, w)
         raise NotImplementedError(f"reference: property {type(p).__name__}")
+
+    # -- temporal operators -------------------------------------------------
+    @staticmethod
+    def _range(p):
+        """(lo, hi) of a temporal operator; hi None = unbounded."""
+        base = p.op[2:] if p.op.startswith("s_") else p.op
+        if base == "nexttime":
+            n = 1 if p.lo is None else p.lo.value
+            return n, n
+        if p.lo is None:
+            return 0, None
+        return p.lo.value, (None if p.hi_inf else p.hi.value)
+
+    def _last(self, w, first=0):
+        """Last start tick worth checking for an unbounded quantifier whose
+        first start is `first`: the tail is uniform, so starts deep inside it
+        all behave alike (and starts near the end of the finite word would see
+        a spurious end)."""
+        if w.tail is None:
+            return w.length - 1
+        return min(w.length - 1, max(w.n_real, first) + 10)
+
+    def _H_temporal(self, p, i, env, w):
+        strong = p.op.startswith("s_")
+        base = p.op[2:] if strong else p.op
+        lo, hi = self._range(p)
+        if base == "nexttime":
+            j = i + lo
+            return (not strong) if j >= w.length else self.H(p.prop, j, env, w)
+        top = self._last(w, i + lo) if hi is None else min(i + hi, w.length - 1)
+        js = range(i + lo, top + 1)
+        if base == "always":
+            if strong and i + hi >= w.length:
+                return False
+            return all(self.H(p.prop, j, env, w) for j in js)
+        return any(self.H(p.prop, j, env, w) for j in js)
+
+    def _abort_word(self, p, i, env, w):
+        """accept_on / reject_on (sync forms identical on ticks): from the first
+        tick where the condition holds, the word continues with TOP (accept)
+        or BOT (reject) letters (IEEE 1800 Annex F)."""
+        accept = p.op.endswith("accept_on")
+        # only real ticks trigger an abort (the TOP/BOT tail stands for unknown values)
+        for j in range(i, w.n_real):
+            if holds_bool(p.cond, w.letter(j), env):
+                if self._vacuous_by(p.prop, i, env, j):
+                    return w                # a vacuous success stays (reference behaviour)
+                w2 = Word(self.rows, j, TOP if accept else BOT, 0)
+                w2.length = w.length
+                return w2
+        return w
+
+    def _vacuous_by(self, p, i, env, j):
+        """P (started at i) is decided true by tick j on the real letters, vacuously."""
+        if not self.H(p, i, env, Word(self.rows, j + 1, BOT, self.tail_len)):
+            return False
+        return self.nonvacuous(p, i, env, j) is False
 
     # -- neutral (end of trace) ---------------------------------------------
     def neutral(self, p, i, env, strength):
@@ -289,6 +364,8 @@ class Ref:
                     return True
                 w = Word(self.rows, n, None, 0)
                 for k, e in self.M(p.seq, i, env, w):
+                    if k < i and shift:
+                        k = i               # empty match of a #=# antecedent
                     if k < i:
                         continue
                     if k + shift >= n or self.neutral(p.prop, k + shift, e, strength):
@@ -297,11 +374,52 @@ class Ref:
             shift = 0 if p.op == "|->" else 1
             w = Word(self.rows, n, None, 0)
             for k, e in self.M(p.seq, i, env, w):
-                if k >= i and k + shift < n and not self.neutral(p.prop, k + shift, e, strength):
+                if k < i and shift:
+                    k = i                   # empty match of a |=> antecedent
+                if k < i:
+                    continue
+                if k + shift >= n:
+                    # a consequent that has not seen a tick: only strong obligations fail
+                    if not self._unstarted(p.prop, strength):
+                        return False
+                elif not self.neutral(p.prop, k + shift, e, strength):
                     return False
-                # a consequent that has not seen a tick is not evaluated at the end
-
             return True
+        if isinstance(p, A.PUnaryTemporal):
+            strong = p.op.startswith("s_")
+            base = p.op[2:] if strong else p.op
+            st = "strong" if strong else strength
+            lo, hi = self._range(p)
+            if base == "nexttime":
+                j = i + lo
+                return (not strong) if j >= n else self.neutral(p.prop, j, env, st)
+            js = range(i + lo, n if hi is None else min(i + hi + 1, n))
+            beyond = hi is None or i + hi >= n
+            if base == "always":
+                if strong and beyond:
+                    return False
+                return all(self.neutral(p.prop, j, env, st) for j in js)
+            if any(self.neutral(p.prop, j, env, st) for j in js):
+                return True
+            return (not strong) if beyond else False
+        if isinstance(p, A.PAbort):
+            accept = p.op.endswith("accept_on")
+            for j in range(i, n):
+                if holds_bool(p.cond, self.rows[j], env):
+                    if self._vacuous_by(p.prop, i, env, j):
+                        return True         # ended with a vacuous success at tick j
+                    return self.H(p.prop, i, env, Word(self.rows, j, TOP if accept else BOT, self.tail_len))
+            return self.neutral(p.prop, i, env, strength)
+        if isinstance(p, A.PBin) and p.op in _UNTIL:
+            strong, with_ = p.op.startswith("s_"), p.op.endswith("_with")
+            st = "strong" if strong else strength
+            for k in range(i, n):
+                if self.neutral(p.right, k, env, st) and all(
+                        self.neutral(p.left, j, env, st) for j in range(i, k + (1 if with_ else 0))):
+                    return True
+            if strong:
+                return False
+            return all(self.neutral(p.left, j, env, st) for j in range(i, n))
         if isinstance(p, A.PBin):
             if p.op == "and":
                 return self.neutral(p.left, i, env, strength) and self.neutral(p.right, i, env, strength)
@@ -327,11 +445,16 @@ class Ref:
         if isinstance(p, A.PSeq):
             return (p.strength or strength) == "weak"
         if isinstance(p, A.PNot):
-            return not self._unstarted(p.prop, "strong" if strength == "weak" else "weak")
+            return True             # a negation is not an obligation (engine rule)
         if isinstance(p, A.PImpl):
-            if p.op in ("#-#", "#=#"):      # not (S |-> not P): no match of S on an empty word
-                return False
+            # #-# / #=#: not a failure (reference behaviour)
             return True
+        if isinstance(p, A.PUnaryTemporal):
+            return not p.op.startswith("s_")
+        if isinstance(p, A.PBin) and p.op in _UNTIL:
+            return not p.op.startswith("s_")
+        if isinstance(p, A.PAbort):
+            return self._unstarted(p.prop, strength)
         if isinstance(p, A.PBin) and p.op == "and":
             return self._unstarted(p.left, strength) and self._unstarted(p.right, strength)
         if isinstance(p, A.PBin) and p.op == "or":
@@ -343,6 +466,8 @@ class Ref:
     # -- vacuity (subset) ---------------------------------------------------
     def nonvacuous(self, p, i, env, t):
         """True/False for sequence/implication/if properties; None if not modelled."""
+        if isinstance(p, A.PAbort):
+            return self.nonvacuous(p.prop, i, env, t)
         if A.is_expr(p) or A.is_seq(p) or isinstance(p, A.PSeq):
             return True
         if isinstance(p, A.PImpl) and p.op in ("|->", "|=>"):
@@ -350,6 +475,8 @@ class Ref:
             w = Word(self.rows, t + 1, None, 0)
             any_match = False
             for k, e in self.M(p.seq, i, env, w):
+                if k < i and shift:
+                    k = i
                 if k >= i and k + shift <= t:
                     any_match = True
                     nv = self.nonvacuous(p.prop, k + shift, e, t)

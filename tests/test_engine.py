@@ -110,4 +110,4 @@ def test_errors():
     with pytest.raises(SvaError, match="empty match"):
         run_trace({"p": "a[*0:1]"}, {"a": 1}, [])
     with pytest.raises(SvaUnsupportedError):
-        run_trace({"p": "always a"}, {"a": 1}, [])
+        run_trace({"p": "a |-> s.triggered"}, {"a": 1}, [], named={"s": "a ##1 a"})

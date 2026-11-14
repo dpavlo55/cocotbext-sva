@@ -9,17 +9,22 @@ from collections import Counter
 
 import pytest
 
+from cocotbext.sva import _engine
 from cocotbext.sva._errors import SvaError
 from cocotbext.sva._trace import run_trace
 from refsem import FAIL, PASS, PASS_ANY, VPASS, Ref
+
+# per-attempt comparison needs every start time of merged reports
+_engine.MAX_STARTS = 1 << 30
 
 SIGNALS = {"a": 1, "b": 1, "c": 1, "d": 1, "x": 3, "y": 3}
 
 
 class Gen:
-    def __init__(self, rnd, locals_ok=False):
+    def __init__(self, rnd, locals_ok=False, temporal=False):
         self.r = rnd
         self.locals_ok = locals_ok
+        self.temporal = temporal       # phase 2 property operators
 
     def leaf(self):
         r = self.r
@@ -82,6 +87,8 @@ class Gen:
         r = self.r
         if depth <= 0 or r.random() < 0.25:
             return f"({self.seq(2)})"
+        if self.temporal and r.random() < 0.45:
+            return self.temporal_prop(depth)
         k = r.randint(0, 10)
         p1 = lambda: self.prop(depth - 1)
         if k in (0, 1):
@@ -101,6 +108,33 @@ class Gen:
         if k == 9:
             return f"strong({self.seq(2)})"
         return f"if ({self.leaf()}) ({p1()})"
+
+    def temporal_prop(self, depth):
+        r = self.r
+        p1 = lambda: self.prop(depth - 1)
+        k = r.randint(0, 9)
+        lo = r.randint(0, 2)
+        hi = lo + r.randint(0, 2)
+        if k == 0:
+            op = r.choice(["nexttime", "s_nexttime"])
+            n = r.randint(0, 2)
+            return f"{op}[{n}] ({p1()})" if r.random() < 0.7 else f"{op} ({p1()})"
+        if k == 1:
+            return f"always [{lo}:{hi}] ({p1()})"
+        if k == 2:
+            return f"s_always [{lo}:{hi}] ({p1()})"
+        if k == 3:
+            return f"always [{lo}:$] ({p1()})" if r.random() < 0.5 else f"always ({p1()})"
+        if k == 4:
+            return f"eventually [{lo}:{hi}] ({p1()})"
+        if k == 5:
+            return r.choice([f"s_eventually [{lo}:{hi}] ({p1()})", f"s_eventually [{lo}:$] ({p1()})",
+                             f"s_eventually ({p1()})"])
+        if k in (6, 7):
+            op = r.choice(["until", "s_until", "until_with", "s_until_with"])
+            return f"({p1()}) {op} ({p1()})"
+        op = r.choice(["accept_on", "reject_on", "sync_accept_on", "sync_reject_on"])
+        return f"{op} ({self.leaf()}) ({p1()})"
 
     def local_prop(self):
         r = self.r
@@ -202,9 +236,9 @@ def check_one(text, rows):
     return "ok"
 
 
-def _cases(seed, n, locals_ok):
+def _cases(seed, n, locals_ok, temporal=False):
     rnd = random.Random(seed)
-    g = Gen(rnd)
+    g = Gen(rnd, temporal=temporal)
     for _ in range(n):
         text = g.local_prop() if locals_ok else g.prop(rnd.randint(1, 3))
         yield text, random_trace(rnd, rnd.randint(4, 18))
@@ -227,3 +261,11 @@ def test_fuzz_local_variables():
     for text, rows in _cases(SEED * 1000 + 99, max(50, N // 4), True):
         stats[check_one(text, rows)] += 1
     assert stats["ok"] > 0.8 * max(50, N // 4), stats
+
+
+@pytest.mark.parametrize("chunk", range(4))
+def test_fuzz_temporal(chunk):
+    stats = Counter()
+    for text, rows in _cases(SEED * 1000 + 500 + chunk, N // 4, False, temporal=True):
+        stats[check_one(text, rows)] += 1
+    assert stats["ok"] > 0.6 * (N // 4), stats

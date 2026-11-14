@@ -413,7 +413,20 @@ class Parser:
 
     # -- expressions --------------------------------------------------------
     def parse_expr(self) -> A.Node:
-        return self.parse_cond()
+        """Expression; `->` / `<->` (logical implication / equivalence, lowest
+        precedence, right associative) are rewritten to && / || / !."""
+        start = self.tok.pos
+        left = self.parse_cond()
+        t = self.tok
+        if t.kind == "op" and t.text in ("->", "<->"):
+            self.i += 1
+            right = self.parse_expr()
+            span = self.span_from(start)
+            if t.text == "->":
+                return A.Binary("||", A.Unary("!", left, span=left.span), right, span=span)
+            return A.Binary("==", A.Unary("!", left, span=left.span),
+                            A.Unary("!", right, span=right.span), span=span)
+        return left
 
     def parse_cond(self) -> A.Node:
         start = self.tok.pos
