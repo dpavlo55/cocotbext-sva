@@ -185,7 +185,10 @@ domain first. Wake-up callbacks are never cancelled (cancelling value-change
 callbacks from inside one hangs a commercial simulator): at most one is armed
 per signal, and a stale one costs one evaluated tick. Verified by an
 end-to-end test comparing a sleeping and a non-sleeping domain on the same
-clock (identical failures and counters) on every simulator.
+clock (identical failures and counters) on every simulator. Counting the
+slept edges with raw GPI callbacks instead of the trigger callback was tried
+in phase 3 and not adopted: it cannot be both exact and safe at the end of
+the simulation on every simulator (`phase3-results.md`, 3.4).
 
 ## 6. Sampling semantics
 
@@ -383,7 +386,7 @@ assertion per cycle.
 0. **Calibration and benchmarks** — done, see `phase0-results.md`.
    Phase 1 — done, see `phase1-results.md`.
    Phase 2 — done, see `phase2-results.md`.
-   Phase 3 — in progress, see `phase3-plan.md` and `phase3-results.md`.
+   Phase 3 — done, see `phase3-plan.md` and `phase3-results.md`.
 1. **Core:** parser + IR, NFA + lazy DFA, `EdgeSampler` with demand-driven
    reads, immediate + deferred assertions, sampled-value functions, all
    sequence operators, implications, `disable iff`, clocking events with `iff`,
