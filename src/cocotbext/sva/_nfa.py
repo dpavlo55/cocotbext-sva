@@ -296,6 +296,7 @@ class Nfa:
             self.simple = [[(ops[0][1], ops[0][2], d) for ops, d in ts] for ts in trans]
         self._step_cache: dict = {}
         self._need_cache: dict = {}
+        self._env_cache: dict = {}     # (state, bits) -> base-guard candidates (env mode)
 
     def needs(self, states) -> int:
         """Base atoms read by the next step from these states (env-free states or threads)."""
@@ -327,6 +328,27 @@ class Nfa:
         self._step_cache[key] = hit
         return hit
 
+    def _env_candidates(self, q, bits):
+        """Transitions of state q whose base-atom guards hold for bits, as
+        (rest, dest): rest is None, or the env-literal checks ("e", idx, pol)
+        and assignments ("a", ((local, action), ...)) still to run in order
+        for each thread. Base-atom guards do not depend on the env, so all of
+        them are checked here (once per (state, bits), cached)."""
+        out = []
+        for ops, d in self.trans[q]:
+            pos = neg = 0
+            rest = []
+            for op in ops:
+                if op[0] == 0:
+                    pos |= op[1]
+                    neg |= op[2]
+                    rest += [("e", idx, pol) for idx, pol in op[3]]
+                else:
+                    rest.append(("a", op[1], None))
+            if (bits & pos) == pos and not (bits & neg):
+                out.append((tuple(rest) or None, d))
+        return tuple(out)
+
     def step_env(self, threads: frozenset, val):
         """Step threads (state, env). Returns (next live threads, [env of each match])."""
         nxt = set()
@@ -334,28 +356,31 @@ class Nfa:
         final = self.final
         live = self.live
         bits = val.bits
+        need = self.need
+        cache = self._env_cache
         for q, env in threads:
-            for ops, d in self.trans[q]:
+            key = (q, bits & need[q])
+            cand = cache.get(key)
+            if cand is None:
+                if len(cache) > 200_000:
+                    cache.clear()
+                cand = cache[key] = self._env_candidates(q, bits)
+            for rest, d in cand:
                 e = env
-                ok = True
-                for op in ops:
-                    if op[0] == 0:
-                        if (bits & op[1]) != op[1] or (bits & op[2]):
-                            ok = False
-                            break
-                        for idx, pol in op[3]:
-                            if bool(val.env_atom(idx, e)) != pol:
+                if rest is not None:
+                    ok = True
+                    for kind, x, pol in rest:
+                        if kind == "e":
+                            if bool(val.env_atom(x, e)) != pol:
                                 ok = False
                                 break
-                        if not ok:
-                            break
-                    else:
-                        lst = list(e)
-                        for local, act in op[1]:
-                            lst[local] = val.action(act, e)
-                        e = tuple(lst)
-                if not ok:
-                    continue
+                        else:
+                            lst = list(e)
+                            for local, act in x:
+                                lst[local] = val.action(act, e)
+                            e = tuple(lst)
+                    if not ok:
+                        continue
                 if d in final:
                     matches.append(e)
                 if d in live:
