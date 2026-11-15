@@ -273,7 +273,7 @@ async def test_idle_sleep_matches_awake_evaluation(dut):
     """The same assertions on two domains of the same clock, one with idle
     sleep, one evaluated at every edge: identical failures and counters."""
     await setup(dut)
-    props = {
+    await _sleep_vs_awake(dut, {
         "window": "req |-> ##[1:3] ack",
         "rose": "$rose(req) |=> ##1 ack",
         "past": "en |=> count == $past(count) + 8'd1",
@@ -281,10 +281,27 @@ async def test_idle_sleep_matches_awake_evaluation(dut):
         "tag": "(req, t = tag) |-> ##3 (rsp && rtag == t)",
         "fsm": "start && state == S_IDLE |=> busy until done",
         "cov": "req ##1 req",
-    }
+    }, failures=True)
+
+
+@cocotb.test()
+async def test_idle_sleep_after_history_change(dut):
+    """Assertions decided by sampled-value history alone: the tick before a
+    sleep may read a history that differs from the steady one the skipped
+    ticks see ($rose true, then steady), so it must not be the template for
+    them (an earlier version counted the skipped ticks as passes)."""
+    await setup(dut)
+    await _sleep_vs_awake(dut, {
+        "past2": "$past(en, 2) && !$past(en) |-> count != 8'd0",
+        "rose": "$rose(req) |-> 1'b1",
+        "fell": "$fell(en) |-> !en",
+    }, failures=False, scope="h")
+
+
+async def _sleep_vs_awake(dut, props, failures, scope=""):
     groups = {}
     for key, clk in (("sleep", posedge(dut.clk)), ("awake", "@(posedge clk iff 1'b1)")):
-        g = Assertions(dut, clock=clk, disable_iff="!rst_n", name=key, enums=STATES)
+        g = Assertions(dut, clock=clk, disable_iff="!rst_n", name=scope + key, enums=STATES)
         for n, p in props.items():
             (g.cover_property if n == "cov" else g.assert_property)(p, name=n)
         groups[key] = g
@@ -316,7 +333,7 @@ async def test_idle_sleep_matches_awake_evaluation(dut):
     strip = lambda st: {k.split(".", 1)[1]: v for k, v in st.items()}
     assert strip(res["sleep"][1]) == strip(res["awake"][1])
     assert strip(mid["sleep"]) == strip(mid["awake"])
-    assert res["sleep"][0], "scenario should contain failures"
+    assert bool(res["sleep"][0]) == failures
     if sleep_dom.idle_sleep:            # COCOTBEXT_SVA_IDLE_SLEEP=0 turns it off
         assert sleep_dom.sleeps > 5, sleep_dom.sleeps
     assert awake_dom.sleeps == 0

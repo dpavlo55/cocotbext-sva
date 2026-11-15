@@ -383,8 +383,14 @@ class _Domain:
         for m in run.others:
             if not m.sleepable():
                 return
-        for _, _, ring in self.channels:
-            if ring.count(ring[0]) != len(ring):
+        # The histories must be steady, and equal to what this tick read
+        # (H[k], taken before this tick's value was appended): the skipped
+        # ticks are counted with this tick's outcome, so they must see the
+        # same past values. (A history that just changed, e.g. $rose true on
+        # this tick, would otherwise be counted as true while asleep.)
+        H = self.H
+        for k, (_, _, ring) in enumerate(self.channels):
+            if ring.count(H[k]) != len(ring):
                 return
         watch = self._watch
         if watch is None:
