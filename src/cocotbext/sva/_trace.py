@@ -16,8 +16,12 @@ from ._prop import FAIL, PASS
 
 
 class TraceBinder:
-    def __init__(self, signals: dict, params: dict | None = None):
-        # signals: name -> width or (width, signed)
+    def __init__(self, signals: dict, params: dict | None = None, resolver=None, names=None):
+        # signals: name -> width or (width, signed); resolver(name) -> width or
+        # (width, signed) or None resolves other names on demand (offline
+        # checking against a waveform dump); names() lists them for hints
+        self.resolver = resolver
+        self.names = names
         self.signals = {}
         for name, spec in signals.items():
             w, s = (spec, False) if isinstance(spec, int) else spec
@@ -35,7 +39,10 @@ class TraceBinder:
             v = self.params[name]
             return ConstRef(v) if isinstance(v, int) else v
         if name not in self.signals:
-            return None
+            spec = self.resolver(name) if self.resolver is not None else None
+            if spec is None:
+                return None
+            self.signals[name] = (spec, False) if isinstance(spec, int) else spec
         w, s = self.signals[name]
         slot = self.slot_index.get(name)
         if slot is None:
@@ -45,7 +52,8 @@ class TraceBinder:
 
     def suggest(self, path):
         import difflib
-        return difflib.get_close_matches(".".join(path), list(self.signals), n=3)
+        known = list(self.signals) + (list(self.names()) if self.names is not None else [])
+        return difflib.get_close_matches(".".join(path), known, n=3)
 
     def x_slot(self, ref):
         name = self.slot_names[ref.slot]
@@ -105,6 +113,90 @@ class _Domain:
         return self.tickno
 
 
+class TraceRun:
+    """Streaming evaluation of assertions over rows fed one tick at a time
+    (step), ended by finish(). run_trace and the offline checker use it.
+
+    `initial` primes the $past histories: a row, None (no default value), or
+    "first" (the first row stepped)."""
+
+    def __init__(self, assertions: dict, signals: dict, params: dict | None = None,
+                 named: dict | None = None, kinds: dict | None = None, initial=None, once=(),
+                 sink=None, resolver=None, names=None):
+        binder = self.binder = TraceBinder(signals, params, resolver, names)
+        named_defs = {}
+        for n, d in (named or {}).items():
+            named_defs[n] = d if isinstance(d, NamedDef) else NamedDef(n, _parse_seq(d), (), d)
+        self.result = TraceResult()
+        self.result.warnings = []
+        sink = sink if sink is not None else _Sink(self.result)
+        self.dom = _Domain()
+        self.mons = []
+        for name, text in assertions.items():
+            spec = parse_assertion(text)
+            prog = Compiler(binder, text, named_defs).compile(spec, (kinds or {}).get(name, "assert"))
+            self.result.warnings += prog.warnings
+            self.mons.append(Monitor(prog, name, sink, self.dom))
+        self.nslots = len(binder.slot_names)
+        self.nx = len(binder.xslot_names)
+        row = self.row = {}
+        self.R = [(lambda n=n: row.get(n, 0)) for n in binder.slot_names]
+        self.RX = [(lambda n=n: row.get((n, "x"), 0)) for n in binder.xslot_names]
+        self.H = [None] * len(binder.channels)
+        self.hist = None
+        self.initial = initial
+        if initial != "first":
+            self._prime(initial)
+        self.run = build_runner([(m, m.tick_once if m.name in once else m.tick_env if m.prog.envmode
+                                  else m.tick) for m in self.mons], make_kernel(self.dom))
+        self.t = 0
+
+    @property
+    def signal_names(self):
+        """Signals the assertions read (values, and X masks)."""
+        return list(self.binder.slot_names), list(self.binder.xslot_names)
+
+    def _prime(self, initial):
+        from collections import deque
+        self.hist = []
+        row = self.row
+        for key, vfn, gfn, depth in self.binder.channels:
+            init = None
+            if initial is not None:
+                row.clear()
+                row.update(initial)
+                init = vfn([None] * self.nslots, self.R, [None] * self.nx, self.RX,
+                           [None] * len(self.binder.channels))
+            self.hist.append(deque([init] * depth, maxlen=depth))
+
+    def step(self, r: dict):
+        if self.hist is None:
+            self._prime(r)
+        t = self.t
+        dom, row, R, RX, H, hist = self.dom, self.row, self.R, self.RX, self.H, self.hist
+        dom.tickno = t
+        dom.ev = t
+        row.clear()
+        row.update(r)
+        c = [None] * self.nslots
+        cx = [None] * self.nx
+        for k, (key, vfn, gfn, depth) in enumerate(self.binder.channels):
+            H[k] = hist[k][0]
+            cur = vfn(c, R, cx, RX, H)
+            if gfn is None or gfn(c, R, cx, RX, H):
+                hist[k].append(cur)
+        self.run(c, R, cx, RX, H, t)
+        self.t = t + 1
+
+    def finish(self, end: bool = True) -> TraceResult:
+        if end:
+            for m in self.mons:
+                m.finish(self.t)
+        for m in self.mons:
+            self.result.stats[m.name] = m.stats.as_dict()
+        return self.result
+
+
 def run_trace(assertions: dict, signals: dict, rows: list, params: dict | None = None,
               named: dict | None = None, kinds: dict | None = None, initial: dict | None = None,
               finish: bool = True, once=()) -> TraceResult:
@@ -112,60 +204,10 @@ def run_trace(assertions: dict, signals: dict, rows: list, params: dict | None =
 
     Assertions named in `once` start a single attempt at the first tick (SV:
     a concurrent assertion in an initial block)."""
-    binder = TraceBinder(signals, params)
-    named_defs = {}
-    for n, d in (named or {}).items():
-        named_defs[n] = d if isinstance(d, NamedDef) else NamedDef(n, _parse_seq(d), (), d)
-    result = TraceResult()
-    result.warnings = []
-    sink = _Sink(result)
-    dom = _Domain()
-    mons = []
-    for name, text in assertions.items():
-        spec = parse_assertion(text)
-        prog = Compiler(binder, text, named_defs).compile(spec, (kinds or {}).get(name, "assert"))
-        result.warnings += prog.warnings
-        mons.append(Monitor(prog, name, sink, dom))
-    nslots = len(binder.slot_names)
-    nx = len(binder.xslot_names)
-    names = binder.slot_names
-    xnames = binder.xslot_names
-    row = {}
-    R = [(lambda n=n: row.get(n, 0)) for n in names]
-    RX = [(lambda n=n: row.get((n, "x"), 0)) for n in xnames]
-    # history channels primed with the initial row (None if not given)
-    from collections import deque
-    hist = []
-    for key, vfn, gfn, depth in binder.channels:
-        init = None
-        if initial is not None:
-            row.clear()
-            row.update(initial)
-            c0 = [None] * nslots
-            init = vfn(c0, R, [None] * nx, RX, [None] * len(binder.channels))
-        hist.append(deque([init] * depth, maxlen=depth))
-    H = [None] * len(binder.channels)
-    run = build_runner([(m, m.tick_once if m.name in once else m.tick_env if m.prog.envmode else m.tick)
-                        for m in mons], make_kernel(dom))
-    for t, r in enumerate(rows):
-        dom.tickno = t
-        dom.ev = t
-        row.clear()
-        row.update(r)
-        c = [None] * nslots
-        cx = [None] * nx
-        for k, (key, vfn, gfn, depth) in enumerate(binder.channels):
-            H[k] = hist[k][0]
-            cur = vfn(c, R, cx, RX, H)
-            if gfn is None or gfn(c, R, cx, RX, H):
-                hist[k].append(cur)
-        run(c, R, cx, RX, H, t)
-    if finish:
-        for m in mons:
-            m.finish(len(rows))
-    for m in mons:
-        result.stats[m.name] = m.stats.as_dict()
-    return result
+    tr = TraceRun(assertions, signals, params, named, kinds, initial, once)
+    for r in rows:
+        tr.step(r)
+    return tr.finish(finish)
 
 
 def _parse_seq(text):

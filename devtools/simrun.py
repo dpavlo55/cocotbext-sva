@@ -83,6 +83,9 @@ def run(
         timescale=("1ns", "1ps"),
     )
     test_args = ["--std=08"] if sim == "ghdl" else []
+    plusargs = []
+    if sim == "ghdl" and os.environ.get("WAVE_VCD"):
+        plusargs.append(f"--vcd={os.environ['WAVE_VCD']}")      # dump for offline checking
     results = runner.test(
         hdl_toplevel=toplevel,
         test_module=test_module,
@@ -90,6 +93,7 @@ def run(
         parameters=parameters or {},
         extra_env={**(extra_env or {}), "CALIB_SIM": sim, "CALIB_LANG": lang},
         test_args=test_args,
+        plusargs=plusargs,
     )
     num_tests, num_failed = get_results(results)
     if num_tests == 0 or num_failed:
