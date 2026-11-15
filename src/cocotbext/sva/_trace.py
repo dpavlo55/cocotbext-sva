@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ._compile import Compiler, NamedDef, gen_value_fn
-from ._engine import Monitor
+from ._engine import Monitor, build_runner, make_kernel
 from ._expr import ConstRef, SignalRef
 from ._parser import parse_assertion
 from ._prop import FAIL, PASS
@@ -99,6 +99,7 @@ class _Sink:
 class _Domain:
     def __init__(self):
         self.tickno = 0
+        self.ev = -1
 
     def now(self):
         return self.tickno
@@ -144,8 +145,11 @@ def run_trace(assertions: dict, signals: dict, rows: list, params: dict | None =
             init = vfn(c0, R, [None] * nx, RX, [None] * len(binder.channels))
         hist.append(deque([init] * depth, maxlen=depth))
     H = [None] * len(binder.channels)
+    run = build_runner([(m, m.tick_once if m.name in once else m.tick_env if m.prog.envmode else m.tick)
+                        for m in mons], make_kernel(dom))
     for t, r in enumerate(rows):
         dom.tickno = t
+        dom.ev = t
         row.clear()
         row.update(r)
         c = [None] * nslots
@@ -155,13 +159,7 @@ def run_trace(assertions: dict, signals: dict, rows: list, params: dict | None =
             cur = vfn(c, R, cx, RX, H)
             if gfn is None or gfn(c, R, cx, RX, H):
                 hist[k].append(cur)
-        for m in mons:
-            if m.name in once:
-                m.tick_once(c, R, cx, RX, H, t)
-            elif m.prog.envmode:
-                m.tick_env(c, R, cx, RX, H, t)
-            else:
-                m.tick(c, R, cx, RX, H, t)
+        run(c, R, cx, RX, H, t)
     if finish:
         for m in mons:
             m.finish(len(rows))

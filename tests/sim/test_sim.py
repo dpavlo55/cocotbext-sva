@@ -72,6 +72,8 @@ async def test_clean_traffic_passes(dut):
     tagp = a.assert_property("(req, t = tag) |-> ##3 (rsp && rtag == t)", name="tag_returns")
     a.assert_property("busy |-> !done", name="busy_not_done")
     a.assert_property("count <= limit", name="py_value", values={"limit": lambda: 255})
+    passed = []
+    a.assert_property("req |-> ##[1:3] ack", name="with_on_pass", on_pass=passed.append)
     cov = a.cover_property("req ##1 req ##1 req", name="three_reqs")
     hs = HandshakeChecker(a, name="hs", clk=dut.clk, rst_n=dut.rst_n, req=dut.req, ack=dut.ack)
     a.check("count == 0", msg="counter not cleared by reset")
@@ -88,6 +90,7 @@ async def test_clean_traffic_passes(dut):
     assert st["t.fsm"]["passes"] > 3
     assert st["t.three_reqs"]["hits"] > 3
     assert st["t.hs.answered"]["passes"] == st["t.req_gets_ack"]["passes"]
+    assert len(passed) == st["t.with_on_pass"]["passes"] == st["t.req_gets_ack"]["passes"]
     assert not a.errors
 
 

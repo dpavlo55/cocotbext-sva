@@ -468,6 +468,13 @@ class Ref:
         """True/False for sequence/implication/if properties; None if not modelled."""
         if isinstance(p, A.PAbort):
             return self.nonvacuous(p.prop, i, env, t)
+        if isinstance(p, A.PUnaryTemporal) and p.op in ("nexttime", "s_nexttime"):
+            # IEEE 1800 16.14.8: nonvacuous iff the evaluation of the operand
+            # at the n-th next tick is
+            n = self._range(p)[0]
+            if i + n > t:
+                return None
+            return self.nonvacuous(p.prop, i + n, env, t)
         if A.is_expr(p) or A.is_seq(p) or isinstance(p, A.PSeq):
             return True
         if isinstance(p, A.PImpl) and p.op in ("|->", "|=>"):

@@ -66,6 +66,16 @@ class Program:
             self._bitsfn_cache[m] = fn
         return fn
 
+    def bits_code(self, m: int) -> Code:
+        """The expression bits_fn(m) evaluates, for inlining (slots as v<slot>)."""
+        idx = [i for i in range(len(self.atoms)) if m >> i & 1]
+        total = Code("")
+        for i in idx:
+            total.merge(self.atoms[i])
+        terms = [f"(({self.atoms[i].text}) << {i})" if i else f"({self.atoms[i].text})" for i in idx]
+        total.text = " | ".join(terms) if terms else "0"
+        return total
+
     def slots_of(self, m: int):
         """(value slots, X slots) read by the base atoms in mask m."""
         hit = self._slots_cache.get(m)
