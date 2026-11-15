@@ -25,7 +25,11 @@ class VcdReader:
     def __init__(self, path):
         self.path = path
         self.ns_per_unit = 1.0
-        self.vars: dict = {}           # full name -> (id code, width)
+        # full name -> (id code, width); a vector dumped one bit per variable
+        # ("$var wire 1 ( tag [3] $end") has a tuple ((id code, shift), ...)
+        # in place of the id code
+        self.vars: dict = {}
+        self._bits: dict = {}          # full name -> [id code of each bit, leftmost first]
         self._lower: dict = {}         # lower-case full name -> full name
         self._f = open(path, "r", encoding="utf-8", errors="replace")
         self._tokens = self._token_stream()
@@ -65,13 +69,23 @@ class VcdReader:
                     if t == "$end":
                         break
                     body.append(t)
-                _kind, width, code, ref = body[0], int(body[1]), body[2], body[3]
+                _kind, width, code = body[0], int(body[1]), body[2]
+                ref = "".join(body[3:])                # "data [7:0]" / "data[7:0]" / "tag [3]"
+                m = re.fullmatch(r"(.*?)\[(-?\d+)\]", ref)
+                if m and width == 1:                   # one bit of a vector
+                    self._bits.setdefault(".".join(scope + [m.group(1)]), []).append(code)
+                    continue
                 ref = re.sub(r"\[.*\]$", "", ref)     # "data[7:0]" -> "data"
                 full = ".".join(scope + [ref])
                 self.vars.setdefault(full, (code, width))
                 self._lower.setdefault(full.lower(), full)
             elif tok == "$enddefinitions":
                 self._skip_to_end()
+                for full, codes in self._bits.items():
+                    if full not in self.vars:
+                        n = len(codes)
+                        self.vars[full] = (tuple((c, n - 1 - k) for k, c in enumerate(codes)), n)
+                        self._lower.setdefault(full.lower(), full)
                 return
             elif tok.startswith("$"):
                 self._skip_to_end()
@@ -275,10 +289,14 @@ class TraceSampler:
         self.result.warnings = list(tr.result.warnings)
         vals, xnames = tr.signal_names
         xset = set(xnames)
-        by_code: dict = {}
+        by_code: dict = {}                          # id code -> [(name, width, bit or None)]
         for name in vals:
             code, width = resolved[name]
-            by_code.setdefault(code, []).append((name, width))
+            if type(code) is tuple:                 # vector dumped bit by bit
+                for c, bit in code:
+                    by_code.setdefault(c, []).append((name, width, bit))
+            else:
+                by_code.setdefault(code, []).append((name, width, None))
         clk_code = clk[0]
         wanted = set(by_code) | {clk_code}
         cur = {}                                    # row of current values
@@ -304,8 +322,14 @@ class TraceSampler:
                     tr.step(cur)                    # values before this time step
                 clk_val = new_clk
             for code, v in changes:
-                for name, width in by_code.get(code, ()):
-                    val, xm = _value(v, width)
+                for name, width, bit in by_code.get(code, ()):
+                    if bit is None:
+                        val, xm = _value(v, width)
+                    else:                           # one bit of the vector
+                        b, xb = _value(v, 1)
+                        m = 1 << bit
+                        val = (cur[name] & ~m) | (b << bit)
+                        xm = (cur.get((name, "x"), 0) & ~m) | (xb << bit)
                     cur[name] = val
                     if name in xset:
                         cur[(name, "x")] = xm

@@ -38,4 +38,11 @@ module dut (
   assign busy  = (state == S_BUSY);
   assign done  = (state == S_DONE);
   assign count = cnt;
+
+  // dump for offline checking (tests/sim/run_offline.py, Icarus): +vcd=<file>
+  string vcd_file;
+  initial if ($value$plusargs("vcd=%s", vcd_file)) begin
+    $dumpfile(vcd_file);
+    $dumpvars(0, dut);
+  end
 endmodule

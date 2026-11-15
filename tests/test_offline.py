@@ -12,16 +12,26 @@ from test_fuzz import SIGNALS, Gen, random_trace
 _CODES = "!#$%&'()*+,-./:;<=>?@"
 
 
-def write_vcd(path, rows, signals, scope=("tb", "dut"), timescale="1ns", period=10, names=None):
+def write_vcd(path, rows, signals, scope=("tb", "dut"), timescale="1ns", period=10, names=None,
+              blast=()):
     """A dump in which every signal changes in the same time step as the
     rising clock edge (like a register): the value sampled at edge k is rows[k].
-    names maps signal -> name written in the dump (default: the same)."""
+    names maps signal -> name written in the dump (default: the same).
+    Vectors in `blast` are dumped one bit per variable, as some simulators do
+    (alternately as "x [2]" and "x[2]")."""
     names = names or {}
     codes = {s: _CODES[i + 1] for i, s in enumerate(signals)}
+    bitcodes = {}
     out = [f"$timescale {timescale} $end"]
     out += [f"$scope module {s} $end" for s in scope]
     out.append(f"$var wire 1 {_CODES[0]} clk $end")
-    for s, w in signals.items():
+    for k, (s, w) in enumerate(signals.items()):
+        if s in blast:
+            for i in reversed(range(w)):
+                bitcodes[s, i] = c = f"{codes[s]}{i}"
+                sep = " " if k % 2 else ""
+                out.append(f"$var wire 1 {c} {names.get(s, s)}{sep}[{i}] $end")
+            continue
         rng = f" [{w - 1}:0]" if w > 1 else ""
         out.append(f"$var wire {w} {codes[s]} {names.get(s, s)}{rng} $end")
     out += ["$upscope $end"] * len(scope) + ["$enddefinitions $end"]
@@ -29,6 +39,8 @@ def write_vcd(path, rows, signals, scope=("tb", "dut"), timescale="1ns", period=
     def val(s, row):
         w, v, xm = signals[s], row.get(s, 0), row.get((s, "x"), 0)
         bits = "".join("x" if xm >> i & 1 else str(v >> i & 1) for i in reversed(range(w)))
+        if s in blast:
+            return "\n".join(f"{b}{bitcodes[s, i]}" for b, i in zip(bits, reversed(range(w))))
         return f"{bits}{codes[s]}" if w == 1 else f"b{bits} {codes[s]}"
 
     out += ["#0", "$dumpvars", f"0{_CODES[0]}"] + [val(s, rows[0]) for s in signals] + ["$end"]
@@ -50,7 +62,7 @@ def _expected(props, rows, kinds):
     return fails, r.stats
 
 
-@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("seed", range(4))
 def test_offline_matches_trace_runner(tmp_path, seed):
     rnd = random.Random(seed)
     g = Gen(rnd, temporal=True)
@@ -64,7 +76,7 @@ def test_offline_matches_trace_runner(tmp_path, seed):
         except SvaError:
             continue
         path = tmp_path / f"c{case}.vcd"
-        write_vcd(path, rows, SIGNALS)
+        write_vcd(path, rows, SIGNALS, blast=("x", "y") if seed == 3 else ())   # seed 3: bit by bit
         ts = TraceSampler(path, clock="posedge clk", scope="tb.dut")
         for n, text in props.items():
             (ts.cover_property if kinds[n] == "cover" else ts.assert_property)(text, name=n)
@@ -121,3 +133,42 @@ def test_disable_iff_negedge_and_errors(tmp_path):
         bad.run()
     with pytest.raises(SvaError, match="clock 'nope' not found"):
         TraceSampler(path, clock="posedge nope").run()
+
+
+def test_corpus_replays_through_vcd(tmp_path):
+    """Every golden-corpus case (except single-attempt ones, which have no
+    offline form) written as a dump and checked offline: failures and
+    counters equal the trace runner's, which test_corpus checks against the
+    reference tool."""
+    from test_corpus import DATA
+    if not DATA["cases"]:
+        pytest.skip("no corpus")
+    signals = DATA["signals"]
+    zeros = {s: 0 for s in signals}
+    checked = 0
+    for case in DATA["cases"]:
+        if case.get("once"):
+            continue
+        rows = [zeros] + case["trace"]
+        props, kinds = case["props"], case["kinds"]
+        r = run_trace(props, signals, rows, kinds=kinds, initial=zeros)
+        fails = sorted((e.assertion, -1 if e.kind == "end_fail" else e.tick, e.starts, e.count,
+                        e.kind == "end_fail") for e in r.events if e.kind in ("fail", "end_fail")
+                       and kinds[e.assertion] != "cover")
+        path = tmp_path / f"{case['id']}.vcd"
+        write_vcd(path, rows, signals)
+        ts = TraceSampler(path, clock="posedge clk", scope="tb.dut")
+        for n, text in props.items():
+            (ts.cover_property if kinds[n] == "cover" else ts.assert_property)(text, name=n)
+        res = ts.run()
+        got = sorted((f.assertion, -1 if f.at_end else (round(f.time_ns) - 5) // 10,
+                      tuple((round(t) - 5) // 10 for t in f.start_times_ns), f.count, f.at_end)
+                     for f in res.failures)
+        assert got == fails, case["id"]
+        for n in props:
+            st = r.stats[n]
+            exp = {"attempts": st["attempts"], "hits": st["passes"]} if kinds[n] == "cover" else st
+            assert res.stats[n] == exp, (case["id"], n)
+        path.unlink()
+        checked += 1
+    assert checked > 700

@@ -59,6 +59,7 @@ def run(
     if not sources:
         sys.exit(f"no {lang} sources for {toplevel}")
 
+    vcd = os.environ.get("WAVE_VCD")   # write a VCD dump there (offline checking)
     build_args = []
     if sim == "verilator":
         if timing:
@@ -81,11 +82,27 @@ def run(
         build_args=build_args,
         parameters=parameters or {},
         timescale=("1ns", "1ps"),
+        **({"waves": True} if sim == "verilator" and vcd else {}),   # build with trace support
     )
     test_args = ["--std=08"] if sim == "ghdl" else []
     plusargs = []
-    if sim == "ghdl" and os.environ.get("WAVE_VCD"):
-        plusargs.append(f"--vcd={os.environ['WAVE_VCD']}")      # dump for offline checking
+    pre_cmd = None
+    if vcd:
+        vcd = Path(vcd).resolve().as_posix()
+        if sim == "ghdl":
+            plusargs.append(f"--vcd={vcd}")
+        elif sim == "nvc":
+            test_args += [f"--wave={vcd}", "--format=vcd"]
+        elif sim == "verilator":
+            test_args += ["--trace", "--trace-file", vcd]   # options of cocotb's main()
+        elif sim == "icarus":
+            plusargs.append(f"+vcd={vcd}")             # $dumpvars block of the design
+            # the runner appends -none (no dump) unless waves: ask for VCD instead
+            orig = runner._test_command
+            runner._test_command = lambda: [["-vcd" if a == "-none" else a for a in c]
+                                            for c in orig()]
+        else:                                          # mixed-language simulators
+            pre_cmd = [f"vcd file {{{vcd}}}; vcd add -r /*"]
     results = runner.test(
         hdl_toplevel=toplevel,
         test_module=test_module,
@@ -94,6 +111,7 @@ def run(
         extra_env={**(extra_env or {}), "CALIB_SIM": sim, "CALIB_LANG": lang},
         test_args=test_args,
         plusargs=plusargs,
+        **({"pre_cmd": pre_cmd} if pre_cmd else {}),
     )
     num_tests, num_failed = get_results(results)
     if num_tests == 0 or num_failed:
