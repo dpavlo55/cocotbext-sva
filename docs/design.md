@@ -325,7 +325,7 @@ trace and added to the regression suite.
 | 1 | One sampling loop per clocking event; lazy DFA; each signal read at most once per cycle; demand-driven reads | 1 |
 | 2 | Fast read path: low-level GPI reads instead of `.value` (5–10× cheaper for narrow signals). Reader chosen per (GPI interface, object type) from a calibrated table, never by probing a live value: VPI ≤ 32 bits → GPI long (masked to unsigned); VHPI any width and anything > 32 bits → GPI binary string. Private cocotb API isolated in one adapter module with a public-API fallback and a per-simulator self-test in CI | 1 |
 | 3 | Idle sleep | 2 |
-| 4 | Optional compiled kernel (Rust/PyO3, abi3 wheels) with pure-Python fallback — only if benchmarks show the Python loop dominates | 3 |
+| 4 | Optional compiled kernel (Rust/PyO3, abi3 wheels, separate distribution) with pure-Python fallback — built in phase 3 because the pure-Python busy cost stayed above target (see `phase3-results.md`) | 3 |
 | 5 | `TraceSampler` offline mode on FST/VCD dumps (zero simulation overhead) | 3 |
 | 6 | `ProbeSampler`: generated HDL wrapper (VHDL-2008 external names / Verilog hierarchical references), one packed read per cycle, optional HDL-side batching (reports delayed by ≤ N cycles, failure time still exact) | 4 |
 
@@ -347,6 +347,14 @@ assertion per cycle.
 
 - Distribution `cocotbext-sva`, import `cocotbext.sva`, BSD-3-Clause.
 - Pure-Python wheel; only runtime dependency is cocotb 2.x.
+- Optional compiled kernel: separate distribution `cocotbext-sva-kernel`
+  (`kernel/`, Rust + PyO3, abi3 wheels built with maturin), import
+  `cocotbext_sva_kernel`, pulled in by `cocotbext-sva[fast]`. Used
+  automatically when importable; `COCOTBEXT_SVA_KERNEL=python|native|auto`.
+  It holds the per-tick state of fast-path assertions (transition tables,
+  attempts in flight, counters); the transition semantics stay in Python
+  (the kernel calls back on a cache miss). Both engines run the full test
+  suite, and a differential test requires identical results.
 - `nox` is the single task runner on Windows, WSL/Linux and CI.
 - Simulator matrix: nvc, GHDL, Verilator, Icarus on Linux; nvc on Windows.
   Other cocotb-supported simulators are expected to work through the same
@@ -357,6 +365,7 @@ assertion per cycle.
 0. **Calibration and benchmarks** — done, see `phase0-results.md`.
    Phase 1 — done, see `phase1-results.md`.
    Phase 2 — done, see `phase2-results.md`.
+   Phase 3 — in progress, see `phase3-plan.md` and `phase3-results.md`.
 1. **Core:** parser + IR, NFA + lazy DFA, `EdgeSampler` with demand-driven
    reads, immediate + deferred assertions, sampled-value functions, all
    sequence operators, implications, `disable iff`, clocking events with `iff`,
