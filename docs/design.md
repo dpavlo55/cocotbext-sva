@@ -124,6 +124,23 @@ number of outstanding attempts, but only for these assertions and only while
 something is outstanding — while waiting for the antecedent they cost the same
 as fast-path assertions. Local variables are in v1.
 
+**Symbolic stepping (phase 3, `_symenv.py`).** An attempt is kept as a
+*shape* plus values: the shape is its term with each distinct env (tuple of
+local values) replaced by a slot number, the env's rank in the sorted list of
+the term's distinct envs; the values are that list. The split is canonical:
+equal terms give equal pairs, so attempts merge exactly as before. Shapes are
+as finite as env-free terms, so transitions are cached per (shape, base-atom
+inputs), as on the fast path. The env-dependent part of a transition is a
+decision tree over the conditions that read locals, built lazily: a missing
+branch is filled by stepping the template symbolically again, with the known
+answers along the path and the others evaluated concretely. A leaf holds the
+verdict, the next shape and generated code that computes the next envs
+(assignments); a final renumbering keeps the pair canonical. The template
+semantics stay defined once (the templates run on symbolic envs).
+Local-variable assertions also skip quiet ticks like fast-path ones, when the
+idle outcome reads no local. `COCOTBEXT_SVA_SYMBOLIC=0` steps concrete terms
+(used by the differential test).
+
 ### 5.3 `cover` counting
 
 SVA counts every matching attempt; merging loses multiplicity. Cover properties
@@ -157,7 +174,8 @@ user callbacks) go to a small relay task that re-raises them in the test.
 **Idle sleep.** After a tick where every assertion of the domain is idle —
 nothing in flight, and the next ticks would only increment counters (no
 failure, no pass callback, no cover hit) — and every `$past` history is
-steady (all entries equal), the clock callback only counts edges. Value-change
+steady (all entries equal, and equal to what that tick read), the clock
+callback only counts edges. Value-change
 callbacks on every signal the idle states read (plus history operands and the
 clocking `iff`) wake the domain; the counted edges are then applied exactly to
 the attempt / vacuity / pass counters and the tick number. Python-valued
