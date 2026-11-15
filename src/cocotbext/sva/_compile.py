@@ -198,7 +198,16 @@ class _Ctx(Resolver):
         expr = self.local_exprs.get(ref.name)
         if expr is None:
             raise SvaError(f"local variable '{ref.name}' is used but never assigned")
-        return self.ec.type(expr)
+        busy = self.__dict__.setdefault("_width_busy", set())
+        if ref.name in busy:
+            raise SvaError(f"the width of local variable '{ref.name}' comes from its first "
+                           f"assignment, which reads '{ref.name}' itself; assign it a value "
+                           f"that does not depend on it first")
+        busy.add(ref.name)
+        try:
+            return self.ec.type(expr)
+        finally:
+            busy.discard(ref.name)
 
     def x_slot(self, ref: SignalRef) -> int:
         return self.binder.x_slot(ref)

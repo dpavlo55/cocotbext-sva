@@ -375,10 +375,7 @@ class Nfa:
                                 ok = False
                                 break
                         else:
-                            lst = list(e)
-                            for local, act in x:
-                                lst[local] = val.action(act, e)
-                            e = tuple(lst)
+                            e = val.assign(e, x)
                     if not ok:
                         continue
                 if d in final:

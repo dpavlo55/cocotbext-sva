@@ -17,6 +17,7 @@ import os
 from operator import itemgetter
 
 from ._prop import FAIL, PASS, VFAIL, VPASS, Val
+from ._symenv import SymCache
 
 # Optional compiled kernel (separate distribution cocotbext-sva-kernel).
 # COCOTBEXT_SVA_KERNEL: auto (default: use it if installed), python, native.
@@ -32,6 +33,8 @@ if KERNEL_MODE != "python":
 _NOQUIET = frozenset()
 
 DISABLED = 4
+# local-variable attempts stepped symbolically (False: concrete terms, for testing)
+SYMBOLIC = os.environ.get("COCOTBEXT_SVA_SYMBOLIC", "1") != "0"
 MAX_STARTS = 16          # start times remembered per merged term
 _CACHE_LIMIT = 100_000   # transitions cached per assertion before flushing
 
@@ -74,7 +77,7 @@ class Monitor:
                  "n_disabled", "n_pending_fail", "_enabled", "_att", "_en_ev", "_sb", "qs",
                  "_quiet", "last_ev", "idle_v", "_start_bit", "_sink_vac", "tmpl", "_init_term",
                  "_intern", "_gstates", "_ntrans", "tokens", "_envfns", "_actfns", "_allbits",
-                 "_fullbits", "_silent", "gs", "meta", "_k", "_kj", "_gs_list", "_gs_ids",
+                 "_fullbits", "_silent", "gs", "meta", "_k", "_kj", "_gs_list", "_gs_ids", "_sym",
                  "__weakref__")
 
     def __init__(self, prog, name: str, sink, domain):
@@ -117,9 +120,10 @@ class Monitor:
         self._gstates: dict = {}
         self._ntrans = 0
         if prog.envmode:
-            self.tokens: dict = {}    # term -> meta
+            self.tokens: dict = {}    # term (symbolic: (shape id, envs)) -> meta
             envfns, actfns = prog.env_fns()
             self._envfns, self._actfns = envfns, actfns
+            self._sym = SymCache(prog.tmpl, prog.nlocals, envfns, actfns) if SYMBOLIC else None
             allmask = (1 << len(prog.atoms)) - 1
             self._allbits = prog.bits_fn(allmask)
         else:
@@ -429,9 +433,17 @@ class Monitor:
 
     # -- token path ---------------------------------------------------------
     def tick_env(self, c, R, cx, RX, H, tickno):
+        if self._sym is not None:
+            self.tick_sym(self._allbits(c, R, cx, RX, H), c, R, cx, RX, H, tickno)
+            return
         prog = self.prog
         toks = self.tokens
         start = self._enabled
+        if self.qs:
+            k = self.domain.ev - self.last_ev - 1
+            if k:
+                self.skip(k)
+            self.qs = _NOQUIET
         if not toks and not start:
             self.idle_v = None
             return
@@ -465,6 +477,84 @@ class Monitor:
         self.tokens = nxt
         self.idle_v = iv if not toks and not nxt else 1
 
+    def tick_sym(self, bits, c, R, cx, RX, H, tickno):
+        """tick_env on (shape id, envs) attempts (see _symenv), given the
+        bits of all base atoms."""
+        toks = self.tokens
+        start = self._enabled
+        if self.qs:
+            k = self.domain.ev - self.last_ev - 1
+            if k:
+                self.skip(k)
+            self.qs = _NOQUIET
+        if not toks and not start:
+            self.idle_v = None
+            return
+        if bits & self.prog.disable_bit:
+            for t, m in toks.items():
+                self._verdict(DISABLED, m, tickno)
+            self.tokens = {}
+            self.idle_v = (-DISABLED if start else None) if not toks else 1
+            if start:
+                self._verdict(DISABLED, None, tickno)
+                if not toks:
+                    self._learn_quiet(bits & self.idle_need())
+            return
+        sym = self._sym
+        trans, needs = sym.trans, sym.need
+        args = (c, R, cx, RX, H)
+        nxt = {}
+        quiet_vac = not self._sink_vac
+        for key, m in toks.items():
+            sid, E = key
+            node = trans[sid].get(bits & needs[sid])
+            if type(node) is tuple:
+                v, sid2, mk, ok = node
+                if v is None:
+                    if mk is None:
+                        E2 = E
+                    else:
+                        E2 = mk(E, *args)
+                        if not ok:
+                            sid2, E2 = sym.canonical(sid2, E2)
+            else:
+                v, sid2, E2 = sym.step(sid, E, bits, args)
+            if v is None:
+                k2 = key if (sid2 == sid and E2 is E) else (sid2, E2)
+                old = nxt.get(k2)
+                nxt[k2] = m if old is None else _merge(old, m)
+            elif v == VPASS and quiet_vac:
+                self.n_vacuous += m[0]
+            else:
+                self._verdict(v, m, tickno)
+        iv = None
+        if start:
+            sid = sym.init_sid
+            node = trans[sid].get(bits & needs[sid])
+            if node is not None and node[0] == VPASS and quiet_vac:
+                v = VPASS                    # (a leaf: query nodes hold a function first)
+            else:
+                v, sid2, E2 = sym.step(sid, sym.init_envs, bits, args)
+            if v is None:
+                k2 = (sid2, E2)
+                m = (1, ((tickno, self.domain.now()),))
+                old = nxt.get(k2)
+                nxt[k2] = m if old is None else _merge(old, m)
+            elif v == VPASS and quiet_vac:
+                self.n_vacuous += 1
+                iv = -VPASS
+            else:
+                iv = -v
+                self._verdict(v, None, tickno)
+        self.tokens = nxt
+        if toks or nxt:
+            self.idle_v = 1
+            return
+        self.idle_v = iv
+        # quiet if the outcome depended on base atoms only (no env condition)
+        if type(trans[sid].get(bits & needs[sid])) is tuple:
+            self._learn_quiet(bits & self.idle_need())
+
     # -- single attempt (SV: concurrent assertion in an initial block) --------
     def tick_once(self, c, R, cx, RX, H, tickno):
         """Like tick/tick_env, but only the first tick starts an attempt."""
@@ -495,9 +585,15 @@ class Monitor:
             return self.prog.kind == "cover"   # a non-matching cover attempt is silent
         return v == -DISABLED
 
+    def idle_need(self) -> int:
+        """Base atoms an idle tick reads (symbolic env mode)."""
+        return self._sym.need[self._sym.init_sid] | self.prog.disable_bit
+
     def idle_slots(self):
         """(slots, xslots) the idle state reads each tick."""
         if self.prog.envmode:
+            if self._sym is not None and not self.tokens:
+                return self.prog.slots_of(self.idle_need())
             return self.prog.all_slots()
         if self._k is not None:
             return self.prog.slots_of(self._gs_list[0].need)
@@ -527,6 +623,9 @@ class Monitor:
     def pending(self):
         """[(term, meta)] of attempts still in flight."""
         if self.prog.envmode:
+            if self._sym is not None:
+                term = self._sym.term
+                return [(term(sid, E), m) for (sid, E), m in self.tokens.items()]
             return list(self.tokens.items())
         if self._k is not None:
             sid, metas = self._k.K.peek(self._kj)
@@ -672,6 +771,26 @@ def build_runner(entries, kd=None):
             body += ["        " + ln for ln in _prelude(full)]
             body.append(f"            {fv} = {full.text}")
             body.append(f"        T{i}({fv}, t)")
+            body.append("        n += 1")
+        elif getattr(step, "__func__", None) is Monitor.tick_env and step.__self__ is m                 and m._sym is not None:
+            code = m.prog.bits_code(m.idle_need())
+            text = f"({code.text}) | {m._start_bit}"
+            var = exprs.get(text)
+            if var is None:
+                var = exprs[text] = f"b{len(exprs)}"
+                total.merge(code)
+                body.append(f"    {var} = {text}")
+            full = m.prog.bits_code((1 << len(m.prog.atoms)) - 1)
+            fv = fulls.get(full.text)
+            ns[f"M{i}"] = m
+            ns[f"Y{i}"] = m.tick_sym
+            body.append(f"    if {var} not in M{i}.qs:")
+            if fv is None:
+                fv = fulls[full.text] = f"f{len(fulls)}"
+            body.append(f"        if {fv} is None:")
+            body += ["        " + ln for ln in _prelude(full)]
+            body.append(f"            {fv} = {full.text}")
+            body.append(f"        Y{i}({fv}, c, R, cx, RX, H, t)")
             body.append("        n += 1")
         else:
             body.append(f"    S{i}(c, R, cx, RX, H, t)")

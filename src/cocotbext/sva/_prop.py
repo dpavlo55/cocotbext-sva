@@ -68,6 +68,15 @@ class Val:
     def action(self, idx, env):
         return self.ctx.action(idx, env)
 
+    def assign(self, env, assigns):
+        """env after the assignments ((local, action index), ...) of one
+        transition (every action reads the env before them)."""
+        lst = list(env)
+        ctx = self.ctx
+        for local, act in assigns:
+            lst[local] = ctx.action(act, env)
+        return tuple(lst)
+
 
 def guard_true(g, val: Val, env) -> bool:
     pos, neg, envlits = g
