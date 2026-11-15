@@ -73,9 +73,23 @@ def bench(session):
 
 
 @nox.session(python=False)
+def kernel(session):
+    """Build the compiled kernel (kernel/, Rust) and install it in this environment."""
+    session.chdir("kernel")
+    session.run("maturin", "develop", "--release", external=True)
+
+
+@nox.session(python=False)
 def tests(session):
-    """Unit tests and differential fuzzing (no simulator)."""
+    """Unit tests and differential fuzzing (no simulator); with the compiled
+    kernel installed, once with it and once in pure Python."""
     session.run(sys.executable, "-m", "pytest", "-q", "tests", *session.posargs, external=True)
+    try:
+        import cocotbext_sva_kernel  # noqa: F401
+    except ImportError:
+        return
+    session.run(sys.executable, "-m", "pytest", "-q", "tests", *session.posargs, external=True,
+                env={"COCOTBEXT_SVA_KERNEL": "python"})
 
 
 @nox.session(python=False)

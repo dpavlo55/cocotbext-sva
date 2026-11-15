@@ -1,0 +1,18 @@
+[package]
+name = "cocotbext-sva-kernel"
+version = "0.1.0-dev0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Optional compiled evaluation kernel for cocotbext-sva"
+publish = false
+
+[lib]
+name = "cocotbext_sva_kernel"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

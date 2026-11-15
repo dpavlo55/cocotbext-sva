@@ -16,3 +16,4 @@ calibration/types.jsonl
 build/
 *.out
 *.prof
+kernel/target/

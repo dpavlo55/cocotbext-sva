@@ -2,4 +2,5 @@
 cocotb>=2.0,<3
 pytest
 nox
+maturin>=1.5,<2   # builds the optional compiled kernel (nox -s kernel; needs Rust)
 -e .

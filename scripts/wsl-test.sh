@@ -20,7 +20,7 @@ export PATH="$PATH:$shims:$oss/bin"
 
 mkdir -p "$dst"
 rsync -a --delete --exclude '.git/' --exclude '.venv/' --exclude 'sim_build/' \
-      --exclude '__pycache__/' --exclude 'local/' "$src/" "$dst/"
+      --exclude '__pycache__/' --exclude 'local/' --exclude 'target/' "$src/" "$dst/"
 cd "$dst"
 
 if [ ! -x .venv/bin/python ]; then python3 -m venv .venv; fi

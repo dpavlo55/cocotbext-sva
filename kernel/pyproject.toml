@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cocotbext-sva-kernel"
+version = "0.1.0.dev0"
+description = "Optional compiled evaluation kernel for cocotbext-sva (used automatically when installed)"
+license = "BSD-3-Clause"
+requires-python = ">=3.10"
+classifiers = [
+    "Framework :: cocotb",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+
+[tool.maturin]
+module-name = "cocotbext_sva_kernel"
+features = ["pyo3/extension-module"]
