@@ -1,5 +1,6 @@
-"""Offline checking: concurrent assertions evaluated on a waveform dump (VCD)
-after the simulation, with no simulation overhead.
+"""Offline checking: concurrent assertions evaluated on a waveform dump (VCD,
+or FST with the compiled kernel installed) after the simulation, with no
+simulation overhead.
 
 Signals are sampled at each clock edge of the dump with the value they had
 just before the edge's time step (a change in the same time step as the edge
@@ -19,8 +20,8 @@ from ._trace import TraceRun
 _UNITS = {"s": 1e9, "ms": 1e6, "us": 1e3, "ns": 1.0, "ps": 1e-3, "fs": 1e-6}
 
 
-class VcdReader:
-    """Header of a VCD file plus a streaming iterator over its time steps."""
+class _Dump:
+    """Variables of a waveform dump, by full dotted name."""
 
     def __init__(self, path):
         self.path = path
@@ -31,6 +32,39 @@ class VcdReader:
         self.vars: dict = {}
         self._bits: dict = {}          # full name -> [id code of each bit, leftmost first]
         self._lower: dict = {}         # lower-case full name -> full name
+
+    def _add_var(self, full, width, code):
+        """full: dotted name, possibly with a range or bit select
+        ("tb.data [7:0]", "tb.data[7:0]", "tb.tag [3]")."""
+        m = re.fullmatch(r"(.*?)\s*\[(-?\d+)\]", full)
+        if m and width == 1:                       # one bit of a vector
+            self._bits.setdefault(m.group(1), []).append(code)
+            return
+        full = re.sub(r"\s*\[[^.]*\]$", "", full)   # "data [7:0]" -> "data"
+        self.vars.setdefault(full, (code, width))
+        self._lower.setdefault(full.lower(), full)
+
+    def _end_vars(self):
+        for full, codes in self._bits.items():
+            if full not in self.vars:
+                n = len(codes)
+                self.vars[full] = (tuple((c, n - 1 - k) for k, c in enumerate(codes)), n)
+                self._lower.setdefault(full.lower(), full)
+
+    def find(self, name: str):
+        """Full name -> (id code, width), exact or case-insensitive; or None."""
+        hit = self.vars.get(name)
+        if hit is None:
+            full = self._lower.get(name.lower())
+            hit = self.vars.get(full) if full is not None else None
+        return hit
+
+
+class VcdReader(_Dump):
+    """Header of a VCD file plus a streaming iterator over its time steps."""
+
+    def __init__(self, path):
+        super().__init__(path)
         self._f = open(path, "r", encoding="utf-8", errors="replace")
         self._tokens = self._token_stream()
         self._read_header()
@@ -70,22 +104,10 @@ class VcdReader:
                         break
                     body.append(t)
                 _kind, width, code = body[0], int(body[1]), body[2]
-                ref = "".join(body[3:])                # "data [7:0]" / "data[7:0]" / "tag [3]"
-                m = re.fullmatch(r"(.*?)\[(-?\d+)\]", ref)
-                if m and width == 1:                   # one bit of a vector
-                    self._bits.setdefault(".".join(scope + [m.group(1)]), []).append(code)
-                    continue
-                ref = re.sub(r"\[.*\]$", "", ref)     # "data[7:0]" -> "data"
-                full = ".".join(scope + [ref])
-                self.vars.setdefault(full, (code, width))
-                self._lower.setdefault(full.lower(), full)
+                self._add_var(".".join(scope + ["".join(body[3:])]), width, code)
             elif tok == "$enddefinitions":
                 self._skip_to_end()
-                for full, codes in self._bits.items():
-                    if full not in self.vars:
-                        n = len(codes)
-                        self.vars[full] = (tuple((c, n - 1 - k) for k, c in enumerate(codes)), n)
-                        self._lower.setdefault(full.lower(), full)
+                self._end_vars()
                 return
             elif tok.startswith("$"):
                 self._skip_to_end()
@@ -96,13 +118,10 @@ class VcdReader:
             if t == "$end":
                 return
 
-    def find(self, name: str):
-        """Full name -> (id code, width), exact or case-insensitive; or None."""
-        hit = self.vars.get(name)
-        if hit is None:
-            full = self._lower.get(name.lower())
-            hit = self.vars.get(full) if full is not None else None
-        return hit
+    def stream(self, wanted: set, on_step):
+        """on_step(time, [(id code, value string), ...]) per time step."""
+        for time, changes in self.steps(wanted):
+            on_step(time, changes)
 
     def steps(self, wanted: set):
         """Yield (time, [(id code, value string), ...]) per time step, only
@@ -135,6 +154,46 @@ class VcdReader:
                 # $dumpvars / $dumpall / $dumpon / $dumpoff / $end: value lists follow or end
         if changes:
             yield time, changes
+
+
+class FstReader(_Dump):
+    """An FST file, read by the compiled kernel (cocotbext-sva-kernel)."""
+
+    def __init__(self, path):
+        super().__init__(path)
+        try:
+            import cocotbext_sva_kernel as kernel
+        except ImportError:
+            raise SvaError(f"{path}: reading FST needs the compiled kernel "
+                           "(pip install cocotbext-sva[fast]); or dump VCD") from None
+        if not hasattr(kernel, "FstFile"):
+            raise SvaError(f"{path}: the installed cocotbext-sva-kernel cannot read FST; update it")
+        self._fst = kernel.FstFile(str(path))
+        self.ns_per_unit = 10.0 ** (self._fst.timescale_exponent + 9)
+        self._real = set()
+        for full, handle, width, real in self._fst.vars():
+            self._add_var(full, width, handle)
+            if real:
+                self._real.add(handle)
+        self._end_vars()
+
+    def close(self):
+        self._fst = None
+
+    def stream(self, wanted: set, on_step):
+        """on_step(time, [(handle, value string), ...]) per time step."""
+        if wanted & self._real:
+            raise SvaError(f"{self.path}: real-valued signals are not supported")
+        self._fst.read_all(sorted(wanted), on_step)
+
+
+def open_dump(path):
+    """A VcdReader or FstReader, by the file's content: a VCD file is text
+    starting with a $ keyword; FST is binary (a header block, or a gzip
+    wrapper as nvc and GHDL write)."""
+    with open(path, "rb") as f:
+        head = f.read(256).lstrip()
+    return VcdReader(path) if head.startswith(b"$") else FstReader(path)
 
 
 def _value(s: str, width: int):
@@ -204,7 +263,9 @@ class _Sink:
 
 
 class TraceSampler:
-    """Concurrent assertions checked on a VCD dump after the simulation.
+    """Concurrent assertions checked on a waveform dump after the simulation:
+    VCD, or FST when the compiled kernel (cocotbext-sva[fast]) is installed
+    (the format is detected from the file's content).
 
         ts = TraceSampler("waves.vcd", clock="posedge clk", scope="tb.dut",
                           disable_iff="!rst_n")
@@ -258,13 +319,13 @@ class TraceSampler:
         return f"{self.scope}.{name}" if self.scope else name
 
     def run(self) -> OfflineResult:
-        vcd = VcdReader(self.path)
+        dump = open_dump(self.path)
         try:
-            return self._run(vcd)
+            return self._run(dump)
         finally:
-            vcd.close()
+            dump.close()
 
-    def _run(self, vcd: VcdReader) -> OfflineResult:
+    def _run(self, vcd: _Dump) -> OfflineResult:
         clk = vcd.find(self._full(self.clock_name)) or vcd.find(self.clock_name)
         if clk is None:
             raise SvaError(f"clock {self.clock_name!r} not found in {self.path} (scope {self.scope!r})")
@@ -304,23 +365,25 @@ class TraceSampler:
             cur[name] = 0
             if name in xset:
                 cur[(name, "x")] = 0
-        clk_val = None                              # no value yet: the first one is not an edge
+        clk_val = [None]                            # no value yet: the first one is not an edge
         edge = self.edge
-        for time, changes in vcd.steps(wanted):
-            new_clk = clk_val
+        times, step = self._times, tr.step
+
+        def on_step(time, changes):
+            old = clk_val[0]
+            new_clk = old
             for code, v in changes:
                 if code == clk_code:
                     new_clk = v[-1] if len(v) > 1 else v
-            if clk_val is None:
-                clk_val = new_clk if new_clk is not None else clk_val
-            elif new_clk != clk_val:
-                rose = (clk_val == "0" and new_clk != "0") or (clk_val in "xz" and new_clk == "1")
-                fell = (clk_val == "1" and new_clk != "1") or (clk_val in "xz" and new_clk == "0")
-                if (edge == "posedge" and rose) or (edge == "negedge" and fell) or \
-                        (edge == "edge" and (rose or fell)):
-                    self._times.append(time)
-                    tr.step(cur)                    # values before this time step
-                clk_val = new_clk
+            if old is None:
+                clk_val[0] = new_clk
+            elif new_clk != old:
+                rose = (old == "0" and new_clk != "0") or (old in "xz" and new_clk == "1")
+                fell = (old == "1" and new_clk != "1") or (old in "xz" and new_clk == "0")
+                if (edge == "posedge" and rose) or (edge == "negedge" and fell) or                         (edge == "edge" and (rose or fell)):
+                    times.append(time)
+                    step(cur)                       # values before this time step
+                clk_val[0] = new_clk
             for code, v in changes:
                 for name, width, bit in by_code.get(code, ()):
                     if bit is None:
@@ -333,6 +396,8 @@ class TraceSampler:
                     cur[name] = val
                     if name in xset:
                         cur[(name, "x")] = xm
+
+        vcd.stream(wanted, on_step)
         res = tr.finish()
         self.result.cycles = len(self._times)
         for name, st in res.stats.items():

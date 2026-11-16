@@ -1,4 +1,5 @@
-//! Optional compiled kernel for cocotbext-sva.
+//! Optional compiled kernel for cocotbext-sva (plus the FST reader of the
+//! offline checker, in fst.rs).
 //!
 //! Holds, for the fast-path assertions of one clocking domain, everything the
 //! per-tick evaluation touches: the current global state, the cached
@@ -12,6 +13,8 @@
 //! monitor (steps the idle monitors, returns which busy-state inputs are
 //! needed), then, if needed, `tick_b` with those (steps the busy monitors and
 //! returns the events to report).
+
+mod fst;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
@@ -513,6 +516,7 @@ impl Kernel {
 #[pymodule]
 fn cocotbext_sva_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Kernel>()?;
+    m.add_class::<fst::FstFile>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

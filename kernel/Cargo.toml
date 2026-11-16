@@ -11,6 +11,7 @@ name = "cocotbext_sva_kernel"
 crate-type = ["cdylib"]
 
 [dependencies]
+fst-reader = "0.17"
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
 
 [profile.release]

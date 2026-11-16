@@ -1,6 +1,10 @@
-"""Offline checking of VCD dumps (TraceSampler) must give the results of the
-trace runner on the same samples."""
+"""Offline checking of VCD and FST dumps (TraceSampler) must give the results
+of the trace runner on the same samples. FST files are made from the VCD
+files by GTKWave's vcd2fst (an independent writer); those tests are skipped
+when vcd2fst or the compiled kernel's FST reader is not available."""
 import random
+import shutil
+import subprocess
 
 import pytest
 
@@ -10,6 +14,27 @@ from cocotbext.sva._trace import run_trace
 from test_fuzz import SIGNALS, Gen, random_trace
 
 _CODES = "!#$%&'()*+,-./:;<=>?@"
+
+
+def _fst_available():
+    try:
+        import cocotbext_sva_kernel as k
+    except ImportError:
+        return False
+    return hasattr(k, "FstFile") and shutil.which("vcd2fst") is not None
+
+
+FORMATS = ["vcd", pytest.param("fst", marks=pytest.mark.skipif(
+    not _fst_available(), reason="needs vcd2fst and the kernel's FST reader"))]
+
+
+def as_format(path, fmt):
+    """The dump at path (VCD), or an FST conversion of it."""
+    if fmt == "vcd":
+        return path
+    fst = path.with_suffix(".fst")
+    subprocess.run(["vcd2fst", str(path), str(fst)], check=True, capture_output=True)
+    return fst
 
 
 def write_vcd(path, rows, signals, scope=("tb", "dut"), timescale="1ns", period=10, names=None,
@@ -62,8 +87,9 @@ def _expected(props, rows, kinds):
     return fails, r.stats
 
 
+@pytest.mark.parametrize("fmt", FORMATS)
 @pytest.mark.parametrize("seed", range(4))
-def test_offline_matches_trace_runner(tmp_path, seed):
+def test_offline_matches_trace_runner(tmp_path, seed, fmt):
     rnd = random.Random(seed)
     g = Gen(rnd, temporal=True)
     checked = 0
@@ -77,7 +103,7 @@ def test_offline_matches_trace_runner(tmp_path, seed):
             continue
         path = tmp_path / f"c{case}.vcd"
         write_vcd(path, rows, SIGNALS, blast=("x", "y") if seed == 3 else ())   # seed 3: bit by bit
-        ts = TraceSampler(path, clock="posedge clk", scope="tb.dut")
+        ts = TraceSampler(as_format(path, fmt), clock="posedge clk", scope="tb.dut")
         for n, text in props.items():
             (ts.cover_property if kinds[n] == "cover" else ts.assert_property)(text, name=n)
         res = ts.run()
@@ -98,11 +124,12 @@ def test_offline_matches_trace_runner(tmp_path, seed):
     assert checked > 20
 
 
-def test_unknown_values_timescale_and_names(tmp_path):
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_unknown_values_timescale_and_names(tmp_path, fmt):
     rows = [{"a": 0, "b": 0}, {"a": 1, "b": 0}, {"a": 0, ("a", "x"): 1, "b": 1}, {"a": 0, "b": 0}]
     path = tmp_path / "w.vcd"
     write_vcd(path, rows, {"a": 1, "b": 1}, timescale="100ps", names={"a": "A_Sig"})
-    ts = TraceSampler(path, clock="clk", scope="tb.dut")
+    ts = TraceSampler(as_format(path, fmt), clock="clk", scope="tb.dut")
     ts.assert_property("!$isunknown(a_sig)", name="known")
     ts.assert_property("a_sig |=> b", name="ab")
     res = ts.run()
@@ -135,7 +162,8 @@ def test_disable_iff_negedge_and_errors(tmp_path):
         TraceSampler(path, clock="posedge nope").run()
 
 
-def test_corpus_replays_through_vcd(tmp_path):
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_corpus_replays_through_dumps(tmp_path, fmt):
     """Every golden-corpus case (except single-attempt ones, which have no
     offline form) written as a dump and checked offline: failures and
     counters equal the trace runner's, which test_corpus checks against the
@@ -146,8 +174,8 @@ def test_corpus_replays_through_vcd(tmp_path):
     signals = DATA["signals"]
     zeros = {s: 0 for s in signals}
     checked = 0
-    for case in DATA["cases"]:
-        if case.get("once"):
+    for i, case in enumerate(DATA["cases"]):
+        if case.get("once") or (fmt == "fst" and i % 4):    # FST: every 4th case (one vcd2fst each)
             continue
         rows = [zeros] + case["trace"]
         props, kinds = case["props"], case["kinds"]
@@ -157,7 +185,8 @@ def test_corpus_replays_through_vcd(tmp_path):
                        and kinds[e.assertion] != "cover")
         path = tmp_path / f"{case['id']}.vcd"
         write_vcd(path, rows, signals)
-        ts = TraceSampler(path, clock="posedge clk", scope="tb.dut")
+        dump = as_format(path, fmt)
+        ts = TraceSampler(dump, clock="posedge clk", scope="tb.dut")
         for n, text in props.items():
             (ts.cover_property if kinds[n] == "cover" else ts.assert_property)(text, name=n)
         res = ts.run()
@@ -170,5 +199,25 @@ def test_corpus_replays_through_vcd(tmp_path):
             exp = {"attempts": st["attempts"], "hits": st["passes"]} if kinds[n] == "cover" else st
             assert res.stats[n] == exp, (case["id"], n)
         path.unlink()
+        if dump != path:
+            dump.unlink()
         checked += 1
-    assert checked > 700
+    assert checked > (700 if fmt == "vcd" else 170)
+
+
+def test_fst_without_kernel_is_a_clear_error(tmp_path, monkeypatch):
+    import builtins
+    path = tmp_path / "w.fst"
+    path.write_bytes(b"\x00" + bytes(300))       # an FST file starts with a 0 byte (header block)
+    real_import = builtins.__import__
+
+    def no_kernel(name, *a, **kw):
+        if name == "cocotbext_sva_kernel":
+            raise ImportError(name)
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", no_kernel)
+    ts = TraceSampler(path, clock="posedge clk")
+    ts.assert_property("a")
+    with pytest.raises(SvaError, match="reading FST needs the compiled kernel"):
+        ts.run()

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "cocotbext-sva-kernel"
 version = "0.1.0.dev0"
-description = "Optional compiled evaluation kernel for cocotbext-sva (used automatically when installed)"
+description = "Optional compiled evaluation kernel and FST reader for cocotbext-sva (used automatically when installed)"
 license = "BSD-3-Clause"
 requires-python = ">=3.10"
 classifiers = [
