@@ -15,6 +15,7 @@ from cocotb_tools.runner import get_runner
 
 VHDL_ONLY = {"nvc", "ghdl"}
 VERILOG_ONLY = {"icarus", "verilator"}
+FST_SIMS = {"nvc", "ghdl", "icarus", "verilator"}   # write FST dumps
 
 
 def selected_sim() -> str:
@@ -59,7 +60,11 @@ def run(
     if not sources:
         sys.exit(f"no {lang} sources for {toplevel}")
 
-    vcd = os.environ.get("WAVE_VCD")   # write a VCD dump there (offline checking)
+    # dump for offline checking: WAVE_VCD=<file> or WAVE_FST=<file>
+    vcd, fst = os.environ.get("WAVE_VCD"), os.environ.get("WAVE_FST")
+    if fst and sim not in FST_SIMS:
+        sys.exit(f"{sim} does not write FST dumps")
+    dump, fmt = (fst, "fst") if fst else (vcd, "vcd")
     build_args = []
     if sim == "verilator":
         if timing:
@@ -67,6 +72,10 @@ def run(
         if public:
             build_args.append("--public-flat-rw")
         build_args += ["-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-WIDTHTRUNC"]
+        if fst:
+            build_args.append("--trace-fst")
+        # extra local build options, e.g. include paths a Verilator install lacks
+        build_args += os.environ.get("VERILATOR_EXTRA_ARGS", "").split()
     if sim == "nvc":
         build_args.append("--std=2008")
     if sim == "ghdl":
@@ -82,27 +91,27 @@ def run(
         build_args=build_args,
         parameters=parameters or {},
         timescale=("1ns", "1ps"),
-        **({"waves": True} if sim == "verilator" and vcd else {}),   # build with trace support
+        **({"waves": True} if sim == "verilator" and dump else {}),   # build with trace support
     )
     test_args = ["--std=08"] if sim == "ghdl" else []
     plusargs = []
     pre_cmd = None
-    if vcd:
-        vcd = Path(vcd).resolve().as_posix()
+    if dump:
+        dump = Path(dump).resolve().as_posix()
         if sim == "ghdl":
-            plusargs.append(f"--vcd={vcd}")
+            plusargs.append(f"--{fmt}={dump}")
         elif sim == "nvc":
-            test_args += [f"--wave={vcd}", "--format=vcd"]
+            test_args += [f"--wave={dump}", f"--format={fmt}"]
         elif sim == "verilator":
-            test_args += ["--trace", "--trace-file", vcd]   # options of cocotb's main()
+            test_args += ["--trace", "--trace-file", dump]  # options of cocotb's main()
         elif sim == "icarus":
-            plusargs.append(f"+vcd={vcd}")             # $dumpvars block of the design
-            # the runner appends -none (no dump) unless waves: ask for VCD instead
+            plusargs.append(f"+vcd={dump}")            # $dumpvars block of the design
+            # the runner appends -none (no dump) unless waves: ask for the format
             orig = runner._test_command
-            runner._test_command = lambda: [["-vcd" if a == "-none" else a for a in c]
+            runner._test_command = lambda: [[f"-{fmt}" if a == "-none" else a for a in c]
                                             for c in orig()]
-        else:                                          # mixed-language simulators
-            pre_cmd = [f"vcd file {{{vcd}}}; vcd add -r /*"]
+        else:                                          # mixed-language simulators (VCD only)
+            pre_cmd = [f"vcd file {{{dump}}}; vcd add -r /*"]
     results = runner.test(
         hdl_toplevel=toplevel,
         test_module=test_module,

@@ -17,6 +17,11 @@ SHIM
 chmod +x "$shims/vvp"
 # appended: system python stays first; shims win over the suite's wrappers
 export PATH="$PATH:$shims:$oss/bin"
+# This Verilator build lacks the lz4 development files its FST writer needs:
+# a local copy of lz4.h and a liblz4.so link to the system runtime library.
+if [ -f "$HOME/tools/lz4/include/lz4.h" ]; then
+    export VERILATOR_EXTRA_ARGS="-CFLAGS -I$HOME/tools/lz4/include -LDFLAGS -L$HOME/tools/lz4/lib"
+fi
 
 mkdir -p "$dst"
 rsync -a --delete --exclude '.git/' --exclude '.venv/' --exclude 'sim_build/' \

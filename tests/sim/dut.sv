@@ -40,6 +40,7 @@ module dut (
   assign count = cnt;
 
   // dump for offline checking (tests/sim/run_offline.py, Icarus): +vcd=<file>
+  // (VCD or FST, as chosen by the -vcd / -fst option of vvp)
   string vcd_file;
   initial if ($value$plusargs("vcd=%s", vcd_file)) begin
     $dumpfile(vcd_file);
