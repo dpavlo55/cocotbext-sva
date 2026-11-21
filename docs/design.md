@@ -1,8 +1,9 @@
 # cocotbext-sva — design
 
-Status: phase 1 implemented. This document records the design decisions
-made before the first line of the package was written. It is the reference for
-contributors; update it when a decision changes.
+Status: phases 0 to 3 implemented, phase 4 in progress (see §13). This
+document records the design decisions made before the first line of the
+package was written. It is the reference for contributors; update it when a
+decision changes.
 
 ## 1. Goal
 
@@ -57,7 +58,7 @@ without touching the engine.
 |---|---|---|
 | `EdgeSampler` | 1 | Reads at the clock-edge callback. Correct for clocks driven from cocotb |
 | `TraceSampler` | 1 (tests), 3 (users) | Replays traces / FST / VCD; engine unit tests and offline checking |
-| `PreponedSampler` | 4 | Correct sampling for clocks generated or gated inside the HDL |
+| `PreponedSampler` | 4 | Correct sampling for clocks generated or gated inside the HDL. Built as a sampling mode of the clock loop (`sampling="preponed"`, §6), not as a class |
 | `ProbeSampler` | 4 | Optional generated HDL wrapper: HDL-side sampling, one packed read, batching |
 
 **Clocking event** is an object, not a signal: signal + edge
@@ -204,8 +205,16 @@ Measured in phase 0 on every simulator (see `phase0-results.md` §1):
   so `EdgeSampler` is wrong there regardless of simulator.
 - **Clock generated inside the HDL** (`after` / `#` delays): correct on
   event-driven simulators, post-edge on Verilator (callbacks run after `eval()`).
-- The package detects assertions clocked by a signal not driven from cocotb
-  and warns; correct support arrives with `PreponedSampler` (phase 4).
+- **Preponed sampling (phase 4).** A read at the start of the time step
+  (`NextTimeStep` callback) returns pre-edge values for every clock kind on
+  every simulator (`phase4-results.md` §1). Each clocking event has a sampling
+  mode: `edge`, `preponed` (snapshot of every signal of the domain at the
+  start of each time step; a tick uses the snapshot of its own time step) or
+  `auto`, the default: both for the first 256 ticks, `preponed` from the
+  first difference on, otherwise `edge` with a short comparison every 4096
+  ticks. The step callback is chained through the read-write phase
+  (read-write phase of step S → start of S+1 → ...) because of simulator
+  limits listed in the results.
 
 X/Z handling: by default an unknown value in a boolean condition is false (like
 an `if`). A strict mode treats unknown in a condition as a failure.
@@ -396,8 +405,10 @@ assertion per cycle.
    `nexttime`, `accept_on` / `reject_on`, `cover`, `expect`, assertion control,
    statistics, vacuity warnings; idle sleep.
 3. **Speed:** optional compiled kernel, offline `TraceSampler`.
-4. **Clocking extensions:** `PreponedSampler`, multi-clock sequences,
-   `ProbeSampler`, library of ready-made checkers.
+4. **Clocking extensions:** `PreponedSampler` (done), multi-clock sequences,
+   `.triggered` / `.ended`, `ProbeSampler`: in progress, see
+   `phase4-results.md`. The library of ready-made checkers is deferred to a
+   later phase.
 
 ## Appendix A — API sketch (not implemented)
 
