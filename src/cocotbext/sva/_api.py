@@ -13,7 +13,8 @@ from fnmatch import fnmatchcase
 from typing import Any, Callable
 
 import cocotb
-from cocotb.triggers import Event, FallingEdge, ReadOnly, RisingEdge, ValueChange
+from cocotb.triggers import (Event, FallingEdge, NextTimeStep, ReadOnly, ReadWrite, RisingEdge,
+                             ValueChange)
 
 from . import _ast as A
 from ._access import signal_info, x_reader
@@ -27,6 +28,14 @@ from ._prop import FAIL, PASS
 _log = logging.getLogger("sva")
 
 SEVERITIES = ("info", "warning", "error", "fatal")
+SAMPLINGS = ("auto", "edge", "preponed")
+# Default sampling of a clock (see _Domain): COCOTBEXT_SVA_SAMPLING=auto|edge|preponed
+DEFAULT_SAMPLING = os.environ.get("COCOTBEXT_SVA_SAMPLING", "auto").lower()
+if DEFAULT_SAMPLING not in SAMPLINGS:
+    raise ValueError(f"COCOTBEXT_SVA_SAMPLING must be one of {SAMPLINGS}")
+CHECK_TICKS = 256        # auto sampling: ticks compared at the start
+RECHECK_EVERY = 4096     # ... then RECHECK_TICKS ticks are compared every so many ticks
+RECHECK_TICKS = 16
 
 
 # --------------------------------------------------------------------------
@@ -34,18 +43,30 @@ SEVERITIES = ("info", "warning", "error", "fatal")
 # --------------------------------------------------------------------------
 
 class ClockingEvent:
-    """A clock signal, an edge and an optional `iff` condition."""
+    """A clock signal, an edge and an optional `iff` condition.
 
-    def __init__(self, signal, edge: str = "posedge", iff: str | None = None):
+    `sampling` selects how values are sampled at a tick of this clock:
+    "edge" reads them when the clock edge is seen (exact for clocks driven
+    from cocotb), "preponed" takes them at the start of the time step (exact
+    for every clock, including clocks generated or derived inside the HDL, at
+    a higher cost per cycle), "auto" (the default) compares the two for a
+    while and keeps "edge" unless they differ.
+    """
+
+    def __init__(self, signal, edge: str = "posedge", iff: str | None = None,
+                 sampling: str | None = None):
         if edge not in ("posedge", "negedge", "edge"):
             raise ValueError("edge must be 'posedge', 'negedge' or 'edge'")
+        if sampling is not None and sampling not in SAMPLINGS:
+            raise ValueError(f"sampling must be one of {SAMPLINGS}")
         self.signal = signal
         self.edge = edge
         self.iff_text = iff
+        self.sampling = sampling
 
     def iff(self, condition: str) -> "ClockingEvent":
         """Qualify the clock: ticks only count when `condition` is true (like `@(posedge clk iff en)`)."""
-        return ClockingEvent(self.signal, self.edge, condition)
+        return ClockingEvent(self.signal, self.edge, condition, self.sampling)
 
     def __repr__(self):
         name = getattr(self.signal, "_path", self.signal)
@@ -53,16 +74,16 @@ class ClockingEvent:
         return f"@({s} iff {self.iff_text})" if self.iff_text else f"@({s})"
 
 
-def posedge(signal) -> ClockingEvent:
-    return ClockingEvent(signal, "posedge")
+def posedge(signal, sampling: str | None = None) -> ClockingEvent:
+    return ClockingEvent(signal, "posedge", sampling=sampling)
 
 
-def negedge(signal) -> ClockingEvent:
-    return ClockingEvent(signal, "negedge")
+def negedge(signal, sampling: str | None = None) -> ClockingEvent:
+    return ClockingEvent(signal, "negedge", sampling=sampling)
 
 
-def edge(signal) -> ClockingEvent:
-    return ClockingEvent(signal, "edge")
+def edge(signal, sampling: str | None = None) -> ClockingEvent:
+    return ClockingEvent(signal, "edge", sampling=sampling)
 
 
 # --------------------------------------------------------------------------
@@ -181,9 +202,40 @@ class _Domain:
     callbacks on every signal the idle states read wake the domain up; the
     counted ticks are then applied exactly (attempt and vacuity counters, tick
     numbers). Disable with COCOTBEXT_SVA_IDLE_SLEEP=0.
+
+    Sampling. "edge": values are read in the clock callback. That is the
+    value before the edge for clocks driven from cocotb, on every simulator,
+    but not for clocks generated or derived inside the HDL (signals of the
+    source domain have changed already). "preponed": a callback at the start
+    of every time step (re-armed there) reads every signal of the domain
+    unless the clock already has its active level, and a tick uses the
+    snapshot of its own time step: the values from before the time step, which
+    is what SVA samples, whatever drives the clock. "auto": preponed for the
+    first CHECK_TICKS ticks, comparing the snapshot with the values at the
+    edge; it becomes "preponed" at the first difference (that tick already
+    uses the snapshot), "edge" otherwise, and then compares RECHECK_TICKS
+    ticks again every RECHECK_EVERY ticks.
     """
 
-    def __init__(self, key, clock_handle, edge_kind: str, label: str):
+    def __init__(self, key, clock_handle, edge_kind: str, label: str, sampling: str = "edge"):
+        self.sampling = sampling
+        self._pre = sampling != "edge"  # snapshots are being taken
+        self._check = CHECK_TICKS if sampling == "auto" else 0
+        self._recheck = 0              # edge ticks until the next comparison (auto)
+        self._late = False             # comparing again after ticks that were not compared
+        self._sc: list = []            # snapshot of c / cx at the start of time step _snap_t
+        self._scx: list = []
+        self._sig: list = []           # slots that hold signals (not Python values)
+        self._snap_t = None
+        self._snapped = False          # the last tick used a snapshot
+        self._nts_armed = False
+        self._step_cb = None           # armed start-of-step / read-write callbacks
+        self._rw_cb = None
+        self._wake_t = None            # time step of a wake-up by a signal change
+        self._lvl = None               # (clock reader, level at which no tick can follow)
+        self._watch_slots = ((), ())
+        self.unsnapped = 0             # statistics: preponed ticks without a snapshot
+        self.wake_ticks = 0            # ... ticks in the time step of a wake-up, counted as slept
         self.key = key
         self.clock_handle = clock_handle
         self.edge = edge_kind
@@ -301,6 +353,13 @@ class _Domain:
             self._err = Event()
             self.task = cocotb.start_soon(self._relay())
             self._arm()
+            if self._pre:
+                ll = getattr(self.clock_handle, "_handle", None)
+                level = {"posedge": "1", "negedge": "0"}.get(self.edge)
+                if ll is not None and level is not None:
+                    self._lvl = (ll.get_signal_val_binstr, level)
+                self._arm_step()
+                self._snapshot()
         else:
             self.wake()
 
@@ -324,8 +383,134 @@ class _Domain:
         if self._cb is not None:
             self._cb.cancel()
             self._cb = None
+        # A step callback left armed at the end of the simulation crashes GHDL
+        # and Verilator (see _arm_step).
+        for attr in ("_step_cb", "_rw_cb"):
+            cb = getattr(self, attr)
+            if cb is not None:
+                cb.cancel()
+                setattr(self, attr, None)
+        self._nts_armed = False
         self._unwatch()
         self.sleeping = False
+
+    # -- preponed sampling ------------------------------------------------------
+    def _arm_step(self):
+        """Start the chain of step callbacks: read-write phase of this time
+        step -> start of the next one -> its read-write phase -> ...
+
+        A start-of-step callback is only ever registered from the read-write
+        phase, so none is pending when a test ends at a clock edge or a
+        timer. Measured (phase4-results.md): on Verilator, removing one that
+        was registered from inside a start-of-step callback crashes the
+        simulator, and so does ending the simulation in a time step in which
+        one was registered, removed or not; GHDL crashes at the end if one is
+        left armed. The read-only phase cannot be the link: waiting for it
+        makes GHDL run pending `after` delays early."""
+        if not self._nts_armed:
+            self._nts_armed = True
+            self._rw_cb = ReadWrite()._register(self._on_step_end)
+
+    def _on_step(self):
+        """Start of a time step: take the values a tick in this time step samples."""
+        self._step_cb = None
+        if self.stopped or self.sleeping or not self._pre:
+            self._nts_armed = False
+            return
+        self._rw_cb = ReadWrite()._register(self._on_step_end)
+        lvl = self._lvl
+        if lvl is not None and lvl[0]() == lvl[1]:
+            return                     # the clock cannot tick in this time step
+        self._snapshot()
+
+    def _on_step_end(self):
+        self._rw_cb = None
+        if self.stopped or self.sleeping or not self._pre:
+            self._nts_armed = False
+            return
+        self._step_cb = NextTimeStep()._register(self._on_step)
+
+    def _snapshot(self):
+        R, RX, sc, scx = self.R, self.RX, self._sc, self._scx
+        n = len(R)
+        if len(sc) != n:
+            sc.extend([None] * (n - len(sc)))
+            self._sig = [i for i in range(n) if self.handles[i] is not None]
+        for i in self._sig:
+            sc[i] = R[i]()
+        if RX:
+            if len(scx) != len(RX):
+                scx.extend([None] * (len(RX) - len(scx)))
+            for i in range(len(RX)):
+                scx[i] = RX[i]()
+        self._snap_t = _sim_steps()
+
+    def _load(self) -> bool:
+        """Fill the value cache for a tick in preponed mode; False if the tick
+        was accounted for as a slept one."""
+        c, cx, sc, scx = self.c, self.cx, self._sc, self._scx
+        now = _sim_steps()
+        if self._snap_t == now:
+            if len(sc) != len(c):      # signals added since the snapshot: read at the edge
+                sc.extend([None] * (len(c) - len(sc)))
+                self._sig = [i for i in range(len(c)) if self.handles[i] is not None]
+            if len(scx) != len(cx):
+                scx.extend([None] * (len(cx) - len(scx)))
+            if self._check:
+                self._compare()
+            c[:] = sc
+            cx[:] = scx
+            self._snapped = True
+            return True
+        if self._wake_t == now:
+            # Woken in this time step by a change of a watched signal: before
+            # the time step the values were those the domain slept on.
+            self._wake_t = None
+            self.wake_ticks += 1
+            self._slept(1)
+            return False
+        self.unsnapped += 1
+        self._snapped = False
+        for i in range(len(c)):
+            c[i] = None
+        for i in range(len(cx)):
+            cx[i] = None
+        return True
+
+    def _compare(self):
+        """auto sampling: do reads at the edge still equal the snapshot?"""
+        R, RX, sc, scx = self.R, self.RX, self._sc, self._scx
+        diff = None
+        for i in self._sig:
+            if sc[i] is not None and R[i]() != sc[i]:
+                diff = self.labels[i]
+                break
+        else:
+            for i in range(len(RX)):
+                if scx[i] is not None and RX[i]() != scx[i]:
+                    diff = getattr(self.xhandles[i], "_path", "?")
+                    break
+        if diff is not None:
+            self.sampling = "preponed"
+            self._check = 0
+            if self._late:
+                _log.warning("clock %s: '%s' had already changed when the clock edge was seen "
+                             "(clock generated or derived inside the HDL?). Switching to preponed "
+                             "sampling; this was first seen after %d ticks, so earlier results on "
+                             "this clock may have used values from after the edge. Select "
+                             "sampling='preponed' for this clock.", self.label, diff, self.tickno + 1)
+            else:
+                _log.info("clock %s: '%s' had already changed when the clock edge was seen (clock "
+                          "generated or derived inside the HDL?): using preponed sampling for "
+                          "this clock (sampling='preponed' selects it from the start)",
+                          self.label, diff)
+            return
+        self._check -= 1
+        if not self._check:
+            self.sampling = "edge"
+            self._pre = False          # the step callback stops at its next call
+            self._recheck = RECHECK_EVERY
+            self._late = True
 
     def _on_clock(self):
         if self.stopped:
@@ -345,12 +530,22 @@ class _Domain:
 
     def _tick(self) -> bool:
         """Evaluate one clock edge; False if the clocking event's iff was false."""
-        self.tickno += 1
         c, cx, H, R, RX = self.c, self.cx, self.H, self.R, self.RX
-        for i in range(len(c)):
-            c[i] = None
-        for i in range(len(cx)):
-            cx[i] = None
+        if self._pre:
+            if not self._load():
+                return False
+        else:
+            for i in range(len(c)):
+                c[i] = None
+            for i in range(len(cx)):
+                cx[i] = None
+            if self._recheck:
+                self._recheck -= 1
+                if not self._recheck:  # auto: compare the next ticks again
+                    self._pre = True
+                    self._check = RECHECK_TICKS
+                    self._arm_step()
+        self.tickno += 1
         if self.iff_fn is not None and not self.iff_fn(c, R, cx, RX, H):
             return False
         for k, (vfn, gfn, ring) in enumerate(self.channels):
@@ -397,6 +592,20 @@ class _Domain:
             watch = self._watch = self._watch_set()
         if not watch:
             return                     # a Python value: changes cannot be observed
+        if self._pre:
+            # The tick used values from before this time step. A watched
+            # signal that has changed since would change without waking the
+            # domain: stay awake.
+            if not self._snapped:
+                return
+            R, RX, sc, scx = self.R, self.RX, self._sc, self._scx
+            sl, xs = self._watch_slots
+            for i in sl:
+                if R[i]() != sc[i]:
+                    return
+            for i in xs:
+                if RX[i]() != scx[i]:
+                    return
         self.sleeping = True
         self.sleeps += 1
         self.skipped = 0
@@ -430,23 +639,38 @@ class _Domain:
         for x in xs:
             hd = self.xhandles[x]
             watch[id(hd._handle)] = hd
+        self._watch_slots = (sorted(sl), sorted(xs))
         return watch
 
     def _on_wake(self, key):
         self._armed.discard(key)
         if self.sleeping and not self.stopped:
-            self.wake()
+            self.wake(changed=True)
 
     def _unwatch(self):
         pass                           # see _maybe_sleep: wake-ups are left armed
 
-    def wake(self):
-        """Leave idle sleep, applying the edges counted meanwhile."""
+    def wake(self, changed: bool = False):
+        """Leave idle sleep, applying the edges counted meanwhile.
+
+        changed: called because a watched signal changed, or with nothing
+        else changing (preponed sampling: a tick later in this time step is
+        then one more slept tick; otherwise it uses the values read now)."""
         if not self.sleeping:
             return
         self.sleeping = False
         self._unwatch()
         k, self.skipped = self.skipped, 0
+        self._slept(k)
+        if self._pre:
+            self._arm_step()
+            if changed:
+                self._wake_t = _sim_steps()
+            else:
+                self._wake_t = None
+                self._snapshot()
+
+    def _slept(self, k):
         if k:
             self.ev += k
             kd = self._kd
@@ -463,11 +687,12 @@ _domains: dict = {}
 IDLE_SLEEP = os.environ.get("COCOTBEXT_SVA_IDLE_SLEEP", "1") not in ("0", "", "false", "no")
 
 
-def _get_domain(clock_handle, edge_kind, iff_text, scope_key, label) -> _Domain:
-    key = (getattr(clock_handle, "_handle", clock_handle), edge_kind, iff_text, scope_key if iff_text else None)
+def _get_domain(clock_handle, edge_kind, iff_text, scope_key, label, sampling="edge") -> _Domain:
+    key = (getattr(clock_handle, "_handle", clock_handle), edge_kind, iff_text,
+           scope_key if iff_text else None, sampling)
     d = _domains.get(key)
     if d is None or (d.task is not None and d.task.done()):
-        d = _domains[key] = _Domain(key, clock_handle, edge_kind, label)
+        d = _domains[key] = _Domain(key, clock_handle, edge_kind, label, sampling)
     return d
 
 
@@ -573,7 +798,7 @@ class AssertionHandle:
 
     @property
     def stats(self) -> dict:
-        self.domain.wake()          # apply ticks counted during idle sleep
+        self.domain.wake(True)      # apply ticks counted during idle sleep
         d = self.monitor.stats.as_dict()
         if self.kind == "cover":
             d = {"attempts": d["attempts"], "hits": d["passes"]}
@@ -615,11 +840,18 @@ class Assertions:
         enums: an `enum.IntEnum` class or a dict of enumeration literals
             (`state == S_BUSY`); values are what cocotb reads for the signal.
         signals: name -> handle aliases usable in every assertion of the group.
+        sampling: "auto" (default), "edge" or "preponed": how values are sampled
+            at a clock tick (see ClockingEvent). A clocking event's own
+            sampling= takes precedence.
     """
 
     def __init__(self, scope=None, clock=None, disable_iff: str | None = None, name: str = "sva",
                  params: dict | None = None, enums=None, signals: dict | None = None,
-                 lets: dict | None = None, parent: "Assertions | None" = None):
+                 lets: dict | None = None, parent: "Assertions | None" = None,
+                 sampling: str | None = None):
+        if sampling is not None and sampling not in SAMPLINGS:
+            raise ValueError(f"sampling must be one of {SAMPLINGS}")
+        self.sampling = sampling
         self.scope = scope
         self.clock = clock
         self.disable_iff = disable_iff
@@ -863,7 +1095,7 @@ class Assertions:
             iff = None
             if spec_clock.iff is not None:
                 iff = spec_clock.iff
-            return ("ast", sig, spec_clock.edge or "edge", iff)
+            return ("ast", sig, spec_clock.edge or "edge", iff, self._default_sampling())
         clk = clock_arg if clock_arg is not None else self._default_clock()
         if clk is None:
             raise SvaError("no clock: give the group a clock=, pass clock= or write @(posedge clk) in the property")
@@ -872,11 +1104,20 @@ class Assertions:
             if not text.startswith("@"):
                 text = f"@({text})"
             ev = parse_assertion(text + " 1").clock
-            return ("ast", self._clock_signal(ev.signal, overrides), ev.edge or "edge", ev.iff)
+            return ("ast", self._clock_signal(ev.signal, overrides), ev.edge or "edge", ev.iff,
+                    self._default_sampling())
         if isinstance(clk, ClockingEvent):
             iff = parse_expression(clk.iff_text) if clk.iff_text else None
-            return ("ast", clk.signal, clk.edge, iff)
-        return ("ast", clk, "posedge", None)
+            return ("ast", clk.signal, clk.edge, iff, clk.sampling or self._default_sampling())
+        return ("ast", clk, "posedge", None, self._default_sampling())
+
+    def _default_sampling(self):
+        g = self
+        while g is not None:
+            if g.sampling is not None:
+                return g.sampling
+            g = g.parent
+        return DEFAULT_SAMPLING
 
     def _default_clock(self):
         g = self
@@ -898,12 +1139,12 @@ class Assertions:
         return h
 
     def _domain_for(self, clock_ev, overrides):
-        _, sig, edge_kind, iff = clock_ev
+        _, sig, edge_kind, iff, sampling = clock_ev
         iff_text = None
         if iff is not None:
             iff_text = _node_text(iff)
         label = f"{edge_kind} {getattr(sig, '_path', sig)}"
-        d = _get_domain(sig, edge_kind, iff_text, id(self), label)
+        d = _get_domain(sig, edge_kind, iff_text, id(self), label, sampling)
         if iff is not None and d.iff_fn is None:
             binder = _Binder(self, d, overrides, {})
             ec = ExprCompiler(binder, iff_text)

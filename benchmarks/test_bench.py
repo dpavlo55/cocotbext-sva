@@ -305,12 +305,12 @@ def _time(fn):
     return time.perf_counter() - t0
 
 
-async def _package(dut, k, mixed=False, idle=False, local=False):
+async def _package(dut, k, mixed=False, idle=False, local=False, sampling=None):
     from cocotbext.sva import Assertions, posedge
     stats = {}
 
     async def body():
-        a = Assertions(dut, clock=posedge(dut.clk), name="b")
+        a = Assertions(dut, clock=posedge(dut.clk, sampling=sampling), name="b")
         texts = ["req |-> ##[1:3] ack"]
         if idle:
             texts = ["rare |-> ##[1:3] !rare", "rare |=> !rare"]
@@ -327,6 +327,8 @@ async def _package(dut, k, mixed=False, idle=False, local=False):
         stats["passes"] = sum(v.get("passes", 0) for v in st.values())
         stats["failures"] = len(errs)
     label = "mixed" if mixed else "idle" if idle else "local" if local else "same"
+    if sampling:
+        label += " " + sampling
     await _timed(dut, f"5 cocotbext-sva x{k} {label}", body, stats=stats, assertions=k)
 
 
@@ -353,3 +355,27 @@ async def speed_5_package_50_idle(dut):
 @cocotb.test()
 async def speed_5_package_10_local(dut):
     await _package(dut, 10, local=True)
+
+
+# Preponed sampling (phase 4): values taken at the start of every time step
+# instead of at the clock edge. The scenarios above use the default ("auto"),
+# which settles on edge sampling for this clock.
+
+@cocotb.test()
+async def speed_6_preponed_10(dut):
+    await _package(dut, 10, sampling="preponed")
+
+
+@cocotb.test()
+async def speed_6_preponed_50(dut):
+    await _package(dut, 50, sampling="preponed")
+
+
+@cocotb.test()
+async def speed_6_preponed_50_idle(dut):
+    await _package(dut, 50, idle=True, sampling="preponed")
+
+
+@cocotb.test()
+async def speed_6_edge_50(dut):
+    await _package(dut, 50, sampling="edge")

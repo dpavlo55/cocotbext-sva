@@ -97,6 +97,7 @@ def simtests(session):
     """End-to-end tests of the package on simulators, then offline checking of
     a dump each simulator writes (must equal the online results)."""
     _run_everywhere(session, "tests/sim/run.py")
+    _run_everywhere(session, "tests/sim/run_clocks.py")
     _run_everywhere(session, "tests/sim/run_offline.py")
 
 
