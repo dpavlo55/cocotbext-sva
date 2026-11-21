@@ -90,3 +90,92 @@ async def div_clock(dut):
     res = await _measure(dut.clk_div, {"cnt_div": dut.cnt_div, "cnt_ext(src)": dut.cnt_ext})
     clock.stop()
     _record("HDL-derived clock", res)
+
+
+# --------------------------------------------------------------------------
+# Phase 4: reads at the start of the time step (NextTimeStep callback).
+# Does a snapshot taken there hold the values from before the edge's updates?
+# --------------------------------------------------------------------------
+
+async def _measure_nts(clock_sig, probes, n=SAMPLES):
+    """Trigger callbacks only (as the package's clock loop): a NextTimeStep
+    callback re-armed at every time step snapshots the probes; the edge
+    callback pairs that snapshot with the values settled in ReadOnly."""
+    from cocotb.simtime import get_sim_time
+    from cocotb.triggers import NextTimeStep
+    snap = {"t": None, "v": None, "steps": 0}
+    rows = []                     # [snapshot or None, at_edge, settled]
+    state = {"edges": 0, "stop": False}
+    nts, ro, edge = NextTimeStep(), ReadOnly(), RisingEdge(clock_sig)
+
+    def on_nts():
+        if state["stop"]:
+            return
+        nts._register(on_nts)
+        snap["t"] = get_sim_time("step")
+        snap["v"] = {k: int(h.value) for k, h in probes.items()}
+        snap["steps"] += 1
+
+    def on_ro(row):
+        row.append({k: int(h.value) for k, h in probes.items()})
+
+    def on_edge():
+        if state["stop"]:
+            return
+        edge._register(on_edge)
+        state["edges"] += 1
+        row = [snap["v"] if snap["t"] == get_sim_time("step") else None,
+               {k: int(h.value) for k, h in probes.items()}]
+        rows.append(row)
+        ro._register(lambda: on_ro(row))
+
+    nts._register(on_nts)
+    edge._register(on_edge)
+    while state["edges"] < n + 2:
+        await Timer(10, unit="ns")
+    state["stop"] = True
+    await Timer(20, unit="ns")
+    rows = [r for r in rows[1:] if len(r) == 3][:n]
+    res = {}
+    for k in probes:
+        if any(r[0] is None for r in rows):
+            res[k + "@nts"] = "no snapshot"
+        else:
+            res[k + "@nts"] = _classify([(r[0][k], r[2][k]) for r in rows])
+        res[k + "@edge"] = _classify([(r[1][k], r[2][k]) for r in rows])
+    res["steps_per_edge"] = round(snap["steps"] / max(1, state["edges"]), 2)
+    return res
+
+
+@cocotb.test()
+async def nts_ext_clock_gpi(dut):
+    clock = Clock(dut.clk, 10, unit="ns", impl="gpi")
+    clock.start()
+    res = await _measure_nts(dut.clk, {"cnt_ext": dut.cnt_ext, "cnt_comb": dut.cnt_comb})
+    clock.stop()
+    await Timer(20, unit="ns")
+    _record("NTS cocotb clock (gpi)", res)
+
+
+@cocotb.test()
+async def nts_ext_clock_py(dut):
+    clock = Clock(dut.clk, 10, unit="ns", impl="py")
+    clock.start()
+    res = await _measure_nts(dut.clk, {"cnt_ext": dut.cnt_ext, "cnt_comb": dut.cnt_comb})
+    clock.stop()
+    await Timer(20, unit="ns")
+    _record("NTS cocotb clock (py)", res)
+
+
+@cocotb.test()
+async def nts_int_clock(dut):
+    _record("NTS HDL-generated clock", await _measure_nts(dut.clk_int, {"cnt_int": dut.cnt_int}))
+
+
+@cocotb.test()
+async def nts_div_clock(dut):
+    clock = Clock(dut.clk, 10, unit="ns")
+    clock.start()
+    res = await _measure_nts(dut.clk_div, {"cnt_div": dut.cnt_div, "cnt_ext(src)": dut.cnt_ext})
+    clock.stop()
+    _record("NTS HDL-derived clock", res)
