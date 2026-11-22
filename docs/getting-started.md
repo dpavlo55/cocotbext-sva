@@ -20,7 +20,7 @@ pip install cocotbext-sva
 ```
 
 The optional compiled kernel gives the same results, faster
-([details](guide.md#speed-and-the-compiled-kernel)):
+([details](guide/speed.md)):
 
 ```bash
 pip install cocotbext-sva[fast]
@@ -143,13 +143,13 @@ logging.getLogger("sva").setLevel(logging.WARNING)
 
 ## Next steps
 
-- [Writing assertions](guide.md#writing-assertions): clocks and names,
+- [Writing assertions](guide/assertions.md): clocks and names,
   reusable properties and checkers, immediate assertions, `expect`, several
   clocks in one property.
-- [Supported SVA](guide.md#supported-sva): the operators and functions you can
+- [Supported SVA](guide/supported-sva.md): the operators and functions you can
   use.
-- [`Probe`](guide.md#sampling-inside-the-simulator-probe): lower overhead by
+- [`Probe`](guide/probe.md): lower overhead by
   sampling inside the simulator.
-- [Offline checking](guide.md#offline-checking-of-a-waveform-dump): check
+- [Offline checking](guide/offline.md): check
   assertions on a VCD or FST dump after the simulation.
 - [API reference](api.md): every class and function.

@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://cocotbext-sva.readthedocs.io/en/latest/getting-started.html"><img alt="Getting started" src="https://img.shields.io/badge/%F0%9F%9A%80-Getting%20started-7c6fd6"></a>
-  <a href="https://cocotbext-sva.readthedocs.io/en/latest/guide.html"><img alt="User guide" src="https://img.shields.io/badge/%F0%9F%93%96-User%20guide-7c6fd6"></a>
+  <a href="https://cocotbext-sva.readthedocs.io/en/latest/guide/index.html"><img alt="User guide" src="https://img.shields.io/badge/%F0%9F%93%96-User%20guide-7c6fd6"></a>
   <a href="https://cocotbext-sva.readthedocs.io/en/latest/api.html"><img alt="API reference" src="https://img.shields.io/badge/%F0%9F%A7%A9-API%20reference-7c6fd6"></a>
 </p>
 
@@ -58,7 +58,7 @@ the sampled values:
 - **The SVA property language:** sequences, implications, local variables,
   `$past` and the other sampled-value functions, `always` / `eventually` /
   `until`, `disable iff`, `accept_on`, `cover`, `expect`, immediate
-  assertions ([full list](https://cocotbext-sva.readthedocs.io/en/latest/guide.html#supported-sva)).
+  assertions ([full list](https://cocotbext-sva.readthedocs.io/en/latest/guide/supported-sva.html)).
 - **Several clocks:** clocks generated or derived in the HDL (exact SVA
   sampling), and multi-clock properties (`req |=> @(posedge clk_b) ack_b`).
 - **Reuse:** parameterised properties, named sequences, checkers bound to
@@ -94,7 +94,7 @@ The full documentation is at **https://cocotbext-sva.readthedocs.io**:
 
 - [Getting started](https://cocotbext-sva.readthedocs.io/en/latest/getting-started.html):
   a first test with assertions, in five minutes.
-- [User guide](https://cocotbext-sva.readthedocs.io/en/latest/guide.html): writing assertions,
+- [User guide](https://cocotbext-sva.readthedocs.io/en/latest/guide/index.html): writing assertions,
   clocks and sampling, `Probe`, offline checking, semantics notes, speed.
 - [API reference](https://cocotbext-sva.readthedocs.io/en/latest/api.html): every class and function.
 - [Notes](https://cocotbext-sva.readthedocs.io/en/latest/notes.html): differences from the
