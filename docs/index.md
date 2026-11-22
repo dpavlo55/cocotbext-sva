@@ -33,7 +33,7 @@ New here? Start with [Getting started](getting-started.md).
 :maxdepth: 2
 
 getting-started
-guide
+guide/index
 ```
 
 ```{toctree}

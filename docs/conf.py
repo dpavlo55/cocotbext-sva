@@ -22,7 +22,7 @@ exclude_patterns = ["_build"]
 # the docstrings write `name` for code, as in Markdown
 default_role = "literal"
 
-myst_heading_anchors = 3      # links like guide.md#semantics-notes
+myst_heading_anchors = 3      # links like page.md#section-title
 myst_enable_extensions = ["colon_fence", "deflist"]
 
 autodoc_member_order = "bysource"
