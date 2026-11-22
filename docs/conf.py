@@ -36,7 +36,11 @@ intersphinx_mapping = {
 
 html_theme = "furo"
 html_title = f"cocotbext-sva {release}"
+html_static_path = ["_static"]
+html_favicon = "_static/logo-icon.svg"
 html_theme_options = {
+    "light_logo": "logo-icon.svg",   # the owl above the project name in the sidebar
+    "dark_logo": "logo-icon.svg",
     "source_repository": "https://github.com/dpavlo55/cocotbext-sva",
     "source_branch": "main",
     "source_directory": "docs/",
