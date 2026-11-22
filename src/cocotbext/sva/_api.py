@@ -13,15 +13,16 @@ from fnmatch import fnmatchcase
 from typing import Any, Callable
 
 import cocotb
-from cocotb.triggers import (Event, FallingEdge, NextTimeStep, ReadOnly, ReadWrite, RisingEdge,
-                             ValueChange)
+from cocotb.triggers import (Event, FallingEdge, First, NextTimeStep, ReadOnly, ReadWrite,
+                             RisingEdge, ValueChange)
 
 from . import _ast as A
 from ._access import signal_info, x_reader
 from ._compile import Compiler, NamedDef, gen_value_fn, substitute
-from ._engine import Monitor, build_runner, make_kernel
+from ._engine import GatedStep, Monitor, build_runner, make_kernel
 from ._errors import SvaError, SvaNameError
 from ._expr import ConstRef, ExprCompiler, Resolver, SignalRef
+from ._multiclock import Rewriter, has_clocks, strip_clocks
 from ._parser import parse_assertion, parse_expression, parse_sequence_or_property
 from ._prop import FAIL, PASS
 
@@ -548,6 +549,12 @@ class _Domain:
         self.tickno += 1
         if self.iff_fn is not None and not self.iff_fn(c, R, cx, RX, H):
             return False
+        self._evaluate()
+        return True
+
+    def _evaluate(self):
+        """Step the histories and the assertions on the values in the cache."""
+        c, cx, H, R, RX = self.c, self.cx, self.H, self.R, self.RX
         for k, (vfn, gfn, ring) in enumerate(self.channels):
             H[k] = ring[0]
             cur = vfn(c, R, cx, RX, H)
@@ -566,7 +573,6 @@ class _Domain:
             for hd in self.removals:
                 self.detach(hd)
             self.removals.clear()
-        return True
 
     # -- idle sleep -----------------------------------------------------------
     def _maybe_sleep(self):
@@ -683,6 +689,123 @@ class _Domain:
             # the histories are steady: appending the same value changes nothing
 
 
+def _edge_trigger(handle, edge_kind):
+    return {"posedge": RisingEdge, "negedge": FallingEdge}.get(edge_kind, ValueChange)(handle)
+
+
+class _MultiDomain(_Domain):
+    """The domain of multi-clock assertions on one set of clocks.
+
+    It ticks once per time step in which at least one of the clocks ticks
+    (the assertions are rewritten over that tick stream, see _multiclock).
+    Sampling is preponed: all the clock edges of a time step see the same
+    values. The edge callbacks only note which clocks ticked; the tick is
+    evaluated in the read-only phase of the time step, when every edge has
+    been seen (failure callbacks therefore cannot write signals). On GHDL it
+    is evaluated in the read-write phase instead, because waiting for the
+    read-only phase disturbs the simulation there (see _arm_step); an edge
+    that came after that phase would be a tick of its own.
+
+    No idle sleep."""
+
+    def __init__(self, key, clocks):
+        # clocks: [(handle, edge kind, label)]
+        label = " | ".join(c[2] for c in clocks)
+        super().__init__(key, clocks[0][0], clocks[0][1], label, "preponed")
+        self.idle_sleep = False
+        self.clocks = clocks
+        n = len(clocks)
+        self.iff_fns = [None] * n
+        self._seen = [0] * n            # clocks whose edge was seen in this time step
+        self._flags = [0] * n           # clocks that tick in the tick being evaluated
+        self._pending = False
+        self._eval_cb = None            # armed read-only callback
+        self._at_rw = "ghdl" in getattr(cocotb, "SIM_NAME", "").lower()
+        self._edge_cbs = [None] * n
+        self._trigs = [None] * n
+        self.tick_slots = [self.value_slot(("tick", i), (lambda i=i: self._flags[i]), "@" + clocks[i][2])
+                           for i in range(n)]
+
+    def start(self):
+        if self.task is None or self.task.done():
+            self.stopped = False
+            self.error = None
+            self._err = Event()
+            self.task = cocotb.start_soon(self._relay())
+            for i, (handle, edge_kind, _) in enumerate(self.clocks):
+                self._trigs[i] = _edge_trigger(handle, edge_kind)
+                self._edge_cbs[i] = self._trigs[i]._register(functools.partial(self._on_edge, i))
+            self._arm_step()
+            self._snapshot()
+
+    def _stop(self):
+        for i, cb in enumerate(self._edge_cbs):
+            if cb is not None:
+                cb.cancel()
+                self._edge_cbs[i] = None
+        if self._eval_cb is not None:
+            self._eval_cb.cancel()
+            self._eval_cb = None
+        super()._stop()
+
+    def _on_edge(self, i):
+        if self.stopped:
+            self._edge_cbs[i] = None
+            return
+        self._edge_cbs[i] = self._trigs[i]._register(functools.partial(self._on_edge, i))
+        self._seen[i] = 1
+        self._pending = True
+        if self._at_rw:
+            if self._rw_cb is None:    # (an edge after this time step's read-write callback)
+                self._rw_cb = ReadWrite()._register(self._on_step_end)
+        elif self._eval_cb is None:
+            self._eval_cb = ReadOnly()._register(self._on_eval)
+
+    def _on_eval(self):
+        self._eval_cb = None
+        if self._pending and not self.stopped:
+            self._flush()
+
+    def _on_step_end(self):
+        self._rw_cb = None
+        if self._at_rw and self._pending and not self.stopped:
+            self._flush()
+        if self.stopped:
+            self._nts_armed = False
+        elif self._step_cb is None:
+            self._step_cb = NextTimeStep()._register(self._on_step)
+
+    def _flush(self):
+        """Evaluate the tick of this time step."""
+        self._pending = False
+        try:
+            self._tick()
+        except BaseException as e:     # noqa: B036 - relayed to the test
+            self.error = e
+            self._stop()
+            self._err.set()
+
+    def _tick(self) -> bool:
+        flags, self._seen = self._seen, [0] * len(self.clocks)
+        self._flags = flags
+        self._load()
+        c, cx, H, R, RX = self.c, self.cx, self.H, self.R, self.RX
+        for i, fn in enumerate(self.iff_fns):
+            if flags[i] and fn is not None and not fn(c, R, cx, RX, H):
+                flags[i] = 0
+        if not any(flags):
+            return False
+        self.tickno += 1
+        self._evaluate()
+        return True
+
+    def wake(self, changed: bool = False):
+        # Called before results are read or assertions change: a tick whose
+        # edges were seen in this time step is evaluated first.
+        if self._pending and not self.stopped:
+            self._flush()
+
+
 _domains: dict = {}
 IDLE_SLEEP = os.environ.get("COCOTBEXT_SVA_IDLE_SLEEP", "1") not in ("0", "", "false", "no")
 
@@ -694,6 +817,9 @@ def _get_domain(clock_handle, edge_kind, iff_text, scope_key, label, sampling="e
     if d is None or (d.task is not None and d.task.done()):
         d = _domains[key] = _Domain(key, clock_handle, edge_kind, label, sampling)
     return d
+
+
+_TICK = "$tick"      # name of the tick signal of clock i of a multi-clock domain: $tick<i>
 
 
 class _Binder(Resolver):
@@ -708,6 +834,9 @@ class _Binder(Resolver):
     def lookup(self, path):
         name = ".".join(path)
         g = self.group
+        if name.startswith(_TICK):
+            slot = self.domain.tick_slots[int(name[len(_TICK):])]
+            return SignalRef(slot, 1, False, label=self.domain.labels[slot])
         if name in self.signals:
             return self._signal_ref(self.signals[name], name)
         if name in self.values:
@@ -972,6 +1101,8 @@ class Assertions:
 
         def expect_step(c, R, cx, RX, H, t):
             step(c, R, cx, RX, H, t)
+            if mon._gated and not mon._att:
+                return                 # multi-clock: no tick of the leading clock yet
             state["ticks"] += 1
             if not mon.pending():
                 pass
@@ -988,11 +1119,17 @@ class Assertions:
         # The domain runs in raw simulator callbacks, outside the scheduler:
         # poll on the clock edge instead of waiting on an Event.
         dom = h.domain
-        trig = {"posedge": RisingEdge, "negedge": FallingEdge}.get(dom.edge, ValueChange)(dom.clock_handle)
-        while not state["done"]:
-            await trig
-            if dom.stopped:
-                break
+        if isinstance(dom, _MultiDomain):
+            trigs = [_edge_trigger(hd, e) for hd, e, _ in dom.clocks]
+            while not state["done"] and not dom.stopped:
+                await First(*trigs)
+                dom.wake()             # the tick of this time step
+        else:
+            trig = _edge_trigger(dom.clock_handle, dom.edge)
+            while not state["done"]:
+                await trig
+                if dom.stopped:
+                    break
         return mon.n_failures == 0
 
     def _add(self, kind, prop, name, clock, disable_iff, signals, values, severity, message,
@@ -1005,21 +1142,28 @@ class Assertions:
         overrides = dict(self._signals_chain())
         overrides.update(signals or {})
         text, spec, extra_named = self._prepare(prop, overrides)
-        clock_ev = self._clock_for(spec.clock, clock, overrides)
-        domain = self._domain_for(clock_ev, overrides)
+        named = dict(self.named)
+        named.update(extra_named)
+        lead_slot = None
+        if has_clocks(spec.prop) or _named_clocks(spec.prop, named):
+            spec, clock, domain, lead_slot = self._multiclock(spec, clock, overrides, named, kind, text)
+        if lead_slot is None:
+            clock_ev = self._clock_for(spec.clock, clock, overrides)
+            domain = self._domain_for(clock_ev, overrides)
         binder = _Binder(self, domain, overrides, dict(values or {}))
         dis = None
         if disable_iff is ...:
             disable_iff = self._default_disable()
         if disable_iff is not None and spec.disable is None:
             dis = self._expand_lets(parse_expression(disable_iff))
-        named = dict(self.named)
-        named.update(extra_named)
         compiler = Compiler(binder, text, named)
         prog = compiler.compile(spec, kind, default_disable=dis)
         for w in prog.warnings:
             _log.warning("%s: %s", name, w)
         h = AssertionHandle(root, name, prog, domain, severity, message, on_fail, on_pass, initial)
+        if lead_slot is not None:
+            # attempts start at the ticks of the leading clock only
+            h.step = GatedStep(h.monitor, lead_slot, initial)
         h.enabled_any = True
         root.assertions.append(h)
         domain.monitors.append(h)
@@ -1027,6 +1171,64 @@ class Assertions:
         domain._run = None
         domain.start()
         return h
+
+    def _multiclock(self, spec, clock, overrides, named, kind, text):
+        """A property with clocking events of its own. Returns (spec, clock,
+        domain, slot of the leading clock's tick). If all of them turn out to
+        be one clock: (spec without them, that clock, None, None)."""
+        clocks = {}                      # id -> (handle, edge, iff node)
+
+        def clock_id(ev):
+            if isinstance(ev, A.ClockEvent):
+                sig = self._clock_signal(ev.signal, overrides)
+                edge_kind, iff = ev.edge or "edge", ev.iff
+            else:
+                _, sig, edge_kind, iff, _ = ev
+            cid = (getattr(sig, "_handle", sig), edge_kind, _node_text(iff) if iff is not None else None)
+            clocks.setdefault(cid, (sig, edge_kind, iff))
+            return cid
+
+        default = None
+        if spec.clock is not None or clock is not None or self._default_clock() is not None:
+            default = clock_id(self._clock_for(spec.clock, clock, overrides))
+
+        def no_tick(cid):
+            raise SvaError("no clock: part of the property is not under a clocking event "
+                           "(give the group a clock= or pass clock=)")
+
+        const = ExprCompiler(_Binder(self, None, overrides, {}), text).const
+        rw = Rewriter(clock_id, no_tick, const, named, kind, text)
+        lead, used = rw.analyse(spec.prop, default)
+        if None in used:
+            no_tick(None)
+        if len(used) == 1:
+            sig, edge_kind, iff = clocks[lead]
+            ev = A.ClockEvent(edge_kind, A.Id(("$clk",)), iff)
+            overrides["$clk"] = sig
+            for n, d in list(named.items()):     # (named is the caller's own copy)
+                if has_clocks(d.ast):
+                    named[n] = NamedDef(d.name, strip_clocks(d.ast), d.args, d.text)
+            return (A.AssertionSpec(ev, spec.disable, strip_clocks(spec.prop), span=spec.span),
+                    None, None, None)
+        order = sorted(used, key=lambda cid: (str(getattr(clocks[cid][0], "_path", clocks[cid][0])),
+                                              cid[1], cid[2] or ""))
+        key = ("multi", tuple(order))
+        d = _domains.get(key)
+        if d is None or (d.task is not None and d.task.done()):
+            d = _domains[key] = _MultiDomain(key, [
+                (clocks[cid][0], cid[1],
+                 f"{cid[1]} {getattr(clocks[cid][0], '_path', clocks[cid][0])}"
+                 + (f" iff {cid[2]}" if cid[2] else "")) for cid in order])
+        for i, cid in enumerate(order):
+            iff = clocks[cid][2]
+            if iff is not None and d.iff_fns[i] is None:
+                code = ExprCompiler(_Binder(self, d, overrides, {}), cid[2]).boolean(self._expand_lets(iff))
+                d.iff_fns[i] = gen_value_fn(code)
+        index = {cid: i for i, cid in enumerate(order)}
+        rw.tick = lambda cid: A.Id((f"{_TICK}{index[cid]}",))
+        prop, lead = rw.rewrite(spec.prop, default)
+        return (A.AssertionSpec(None, spec.disable, prop, span=spec.span), None, d,
+                d.tick_slots[index[lead]])
 
     def _signals_chain(self):
         chain = []
@@ -1246,7 +1448,10 @@ class Assertions:
         values = {}
         if not at_end:
             d = h.domain
+            ticks = getattr(d, "tick_slots", ())
             for slot in sorted(h.prog.slots):
+                if slot in ticks:
+                    continue
                 v = d.c[slot]
                 if v is None:
                     try:
@@ -1397,6 +1602,33 @@ class Assertions:
     async def __aexit__(self, exc_type, exc, tb):
         self.finalize(raise_on_failure=exc_type is None)
         return False
+
+
+def _named_clocks(prop, named) -> bool:
+    """Does the property use a named sequence or property that has clocking
+    events of its own?"""
+    if not named:
+        return False
+    seen = set()
+    stack = [prop]
+    while stack:
+        n = stack.pop()
+        if not isinstance(n, A.Node):
+            continue
+        name = n.path[0] if isinstance(n, A.Id) and len(n.path) == 1 else \
+            n.name if isinstance(n, A.Call) else None
+        if name in named and name not in seen:
+            seen.add(name)
+            if has_clocks(named[name].ast):
+                return True
+            stack.append(named[name].ast)
+        for v in vars(n).values():
+            if isinstance(v, A.Node):
+                stack.append(v)
+            elif isinstance(v, list):
+                for item in v:
+                    stack += list(item) if isinstance(item, tuple) else [item]
+    return False
 
 
 def _fmt(v):

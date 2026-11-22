@@ -199,3 +199,142 @@ async def test_preponed_idle_sleep(dut):
         dut._log.info("sleeps=%d wake_ticks=%d", sleep_dom.sleeps, sleep_dom.wake_ticks)
     assert awake_dom.sleeps == 0
     assert sleep_dom.unsnapped == 0 and awake_dom.unsnapped == 0
+
+
+# --------------------------------------------------------------------------
+# Multi-clock properties
+# --------------------------------------------------------------------------
+
+def _int_edge_after(t):
+    """Time of the first rising edge of clk_int strictly after t (7, 21, 35, ... ns)."""
+    k = (int(t) - 7) // 14 + 1
+    return 7 + 14 * max(k, 0)
+
+
+async def _sends(dut, n, seed):
+    """Send n words, far enough apart for the synchroniser; returns
+    [(time of the clk edge that samples send, word)]."""
+    rnd = random.Random(seed)
+    out = []
+    for _ in range(n):
+        word = rnd.randint(0, 255)
+        await cycle(dut, send=1, din=word)
+        out.append((get_sim_time("ns"), word))
+        for _ in range(rnd.randint(8, 12)):
+            await cycle(dut)
+    return out
+
+
+@cocotb.test()
+async def test_multiclock_handshake(dut):
+    """A word sent in the clk domain arrives in the clk_int domain: the
+    request toggle is seen by the first clk_int edge strictly after the clk
+    edge (|=>), and valid_b follows three clk_int ticks later."""
+    await setup(dut)
+    a = Assertions(dut, clock=posedge(dut.clk), name="mc")
+    arrives = a.assert_property("send |=> @(posedge clk_int) ##3 valid_b", name="arrives")
+    data = a.assert_property("(send, v = din) |=> @(posedge clk_int) ##3 (valid_b && data_b == v)",
+                             name="data")
+    early = a.assert_property("send |=> @(posedge clk_int) ##2 valid_b", name="early")   # fails
+    cov = a.cover_property("send ##1 @(posedge clk_int) 1 ##3 valid_b ##1 !valid_b", name="cov")
+    back = a.assert_property("@(posedge clk_int) $rose(valid_b) |-> @(posedge clk) $stable(data_a)",
+                             name="back")
+    sent = await _sends(dut, 12, seed=5)
+    for _ in range(6):
+        await cycle(dut)
+    a.finalize(raise_on_failure=False)
+    failed = {f.name for f in a.failures}
+    assert failed == {"mc.early"}, failed
+    assert arrives.stats["passes"] == len(sent) and data.stats["passes"] == len(sent), a.stats()
+    assert cov.stats["hits"] == len(sent), cov.stats
+    assert back.stats["passes"] == len(sent), back.stats
+    # attempts are counted at the ticks of the leading clock
+    assert arrives.domain is early.domain and arrives.domain is back.domain   # one set of clocks
+    assert 100 < arrives.stats["attempts"] < 160 and arrives.stats["attempts"] == early.stats["attempts"]
+    # each failure of `early` at the third clk_int edge after its clk edge
+    got = sorted((f.time, f.start_times[0]) for f in a.failures)
+    want = sorted((_int_edge_after(t) + 28, t) for t, _ in sent)
+    assert got == want, (got, want)
+    assert arrives.domain.unsnapped == 0
+
+
+@cocotb.test()
+async def test_multiclock_simultaneous_ticks(dut):
+    """clk_div ticks in the same time step as every other clk tick. From such
+    a clk tick, |=> goes to the next clk_div tick and |-> stays on this one."""
+    await setup(dut)
+    a = Assertions(dut, clock=posedge(dut.clk), name="sim")
+    # clk_div low before a clk edge: clk_div rises with it
+    nxt = a.assert_property("req && !clk_div |=> @(posedge clk_div) seen", name="next")
+    same = a.assert_property("req && !clk_div |-> @(posedge clk_div) seen", name="same")     # fails
+    both = a.cover_property("@(posedge clk_div) 1 ##0 @(posedge clk) 1", name="both")
+    rnd = random.Random(4)
+    rec = []                              # (time of the clk edge, req, clk_div before it)
+    for _ in range(300):
+        await FallingEdge(dut.clk)
+        r = int(rnd.random() < 0.5)
+        dut.req.value = r
+        div = int(dut.clk_div.value)
+        await RisingEdge(dut.clk)
+        rec.append((get_sim_time("ns"), r, div))
+    dut.req.value = 0
+    for _ in range(4):
+        await cycle(dut)
+    a.finalize(raise_on_failure=False)
+    assert {f.name for f in a.failures} == {"sim.same"}
+    assert nxt.stats["passes"] > 50 and nxt.stats["failures"] == 0, nxt.stats
+    # seen (before a clk_div edge) is req as sampled by the clk edge two cycles earlier
+    # (req was 0 before the test)
+    want = [(t, t) for i, (t, r, div) in enumerate(rec)
+            if r and not div and (i < 2 or not rec[i - 2][1])]
+    got = sorted((f.time, f.start_times[0]) for f in a.failures)
+    assert got == want, (got[:5], want[:5], len(got), len(want))
+    assert len(want) > 20
+    # clk_div ticks together with clk every time it ticks (once per two clk cycles)
+    assert 145 <= both.stats["hits"] <= 155, both.stats
+
+
+@cocotb.test()
+async def test_multiclock_expect_and_initial(dut):
+    await setup(dut)
+    a = Assertions(dut, clock=posedge(dut.clk), name="x")
+    ev = a.assert_property("s_eventually (send ##1 @(posedge clk_int) 1 ##3 valid_b)", name="ev",
+                           initial=True)
+    never = a.assert_property("@(posedge clk) 1 |=> @(posedge clk_int) s_eventually (cnt_i == 8'd0 && valid_b && !valid_b)",
+                              name="never", initial=True)     # strong, never satisfied
+    for _ in range(3):
+        await cycle(dut)
+    await FallingEdge(dut.clk)
+    dut.send.value = 1
+    dut.din.value = 0x5A
+    ok = cocotb.start_soon(a.expect("send ##1 @(posedge clk_int) 1 ##3 (valid_b && data_b == 8'h5A)",
+                                    name="exp_ok"))
+    bad = cocotb.start_soon(a.expect("send |=> @(posedge clk_int) valid_b", name="exp_bad"))
+    await RisingEdge(dut.clk)
+    for _ in range(12):
+        await cycle(dut)
+    assert ok.done() and bad.done()
+    assert ok.result() is True and bad.result() is False
+    errors = a.finalize(raise_on_failure=False)
+    assert ev.stats == {"attempts": 1, "passes": 1, "vacuous": 0, "failures": 0, "disabled": 0,
+                        "pending_fail": 0}, ev.stats
+    names = sorted(f.name for f in errors)
+    assert names == ["x.exp_bad", "x.never"], names
+    assert [f.at_end for f in errors if f.name == "x.never"] == [True]
+
+
+@cocotb.test()
+async def test_same_clock_written_twice_is_single_clock(dut):
+    """Clocking events that all name one clock do not make an assertion
+    multi-clock: it shares the ordinary domain of that clock."""
+    await setup(dut)
+    a = Assertions(dut, clock=posedge(dut.clk), name="one")
+    h1 = a.assert_property("@(posedge clk) req |=> @(posedge clk) req_q", name="twice")
+    h2 = a.assert_property("req |=> req_q", name="plain")
+    a.sequence("on_int", "@(posedge clk_int) valid_b ##1 !valid_b")
+    h3 = a.cover_property("on_int", name="named")
+    await traffic(dut, 100, seed=9)
+    assert a.finalize(raise_on_failure=False) == []
+    assert h1.domain is h2.domain
+    assert h1.stats == h2.stats and h1.stats["passes"] > 20
+    assert h3.domain is not h1.domain and h3.domain.label.endswith("clk_int"), h3.domain.label
