@@ -73,7 +73,7 @@ commercial simulator (VHDL and SystemVerilog).
 **Sampling.** Reading signals when a clock edge is seen gives SVA sampling
 for clocks driven from cocotb on every tested simulator, but not for clocks
 derived or generated in the HDL: hence `sampling="preponed"` and the default
-`"auto"` (README, "Semantics notes").
+`"auto"` ([guide](guide.md#semantics-notes)).
 
 **Callbacks.** Preponed sampling takes the values at the start of every time
 step (`NextTimeStep`). Behaviours found and worked around:
@@ -119,7 +119,7 @@ in the HDL: pass the end of the test as `run(until_ns=...)`.
 ## Performance
 
 Wall time per simulated clock cycle above the simulation without Python,
-Linux, with the compiled kernel (the README has the summary):
+Linux, with the compiled kernel (the [guide](guide.md#speed-and-the-compiled-kernel) has the summary):
 
 | Load | nvc | Verilator |
 |---|---|---|
