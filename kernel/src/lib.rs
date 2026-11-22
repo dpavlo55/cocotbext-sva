@@ -17,11 +17,16 @@
 //! A gated monitor (multi-clock assertion) starts an attempt only at the
 //! ticks where its gate, a phase A atom (the leading clock ticks), is true;
 //! the kernel counts those attempts.
+//!
+//! Monitors of assertions with local variables keep their attempts here too
+//! (env.rs); they call back into Python for local values.
 
+mod env;
 mod fst;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
+use env::EnvPart;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -155,6 +160,7 @@ struct Mon {
     tab: Tables,
     st: State,
     expand: Py<PyAny>,
+    env: Option<Box<EnvPart>>, // a local-variable monitor
 }
 
 struct Event {
@@ -208,6 +214,7 @@ struct Kernel {
     max_starts: usize, // start ticks remembered per merged attempt
     na: u32,           // number of phase A atoms
     a: Vec<u64>,       // phase A atom words of the current tick
+    args: Option<Py<PyTuple>>, // (c, R, cx, RX, H) of the current tick, for local values
 }
 
 /// The monitor's input bits for the atoms in `need` (start bit not included).
@@ -340,6 +347,18 @@ impl Kernel {
         Ok(())
     }
 
+    fn env_step(&mut self, py: Python<'_>, j: usize, bits: u64, tick: u64) -> PyResult<()> {
+        let start = self.mons[j].st.start(&self.a);
+        let Kernel { mons, events, started, max_starts, args, .. } = self;
+        let Mon { st, env, .. } = &mut mons[j];
+        let e = env.as_mut().expect("a local-variable monitor");
+        let args = match args {
+            Some(a) => a.bind(py).clone(),
+            None => return Err(pyo3::exceptions::PyValueError::new_err("tick without the signal access")),
+        };
+        env::step(py, e, st, events, started, *max_starts, &args, j, bits, start, tick)
+    }
+
     fn take_events(&mut self, py: Python<'_>) -> PyResult<PyObject> {
         if self.events.is_empty() {
             return Ok(py.None());
@@ -361,7 +380,7 @@ impl Kernel {
     #[pyo3(signature = (max_starts=16))]
     fn new(max_starts: usize) -> Self {
         Kernel { mons: Vec::new(), busy: Vec::new(), events: Vec::new(), started: false, max_starts,
-                 na: 0, a: Vec::new() }
+                 na: 0, a: Vec::new(), args: None }
     }
 
     /// Register a monitor (idle, global state 0); returns its index.
@@ -395,8 +414,36 @@ impl Kernel {
                 wants_vac,
             },
             expand,
+            env: None,
         });
         self.mons.len() - 1
+    }
+
+    /// Register a local-variable monitor (no attempt in flight); returns its
+    /// index. Its inputs, gate and enabling are set as for other monitors.
+    #[pyo3(signature = (start_bit, cover, wants_pass, wants_vac, init_sid, init_envs, idle_mask,
+                        all_mask, disable, step_cb, need_cb, canon_cb))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_env(&mut self, py: Python<'_>, start_bit: u64, cover: bool, wants_pass: bool, wants_vac: bool,
+               init_sid: u32, init_envs: Py<PyAny>, idle_mask: u64, all_mask: u64, disable: u64,
+               step_cb: Py<PyAny>, need_cb: Py<PyAny>, canon_cb: Py<PyAny>) -> PyResult<usize> {
+        let expand = step_cb.clone_ref(py);
+        let e = EnvPart::new(py, init_sid, init_envs, idle_mask, all_mask, disable, step_cb, need_cb, canon_cb)?;
+        let j = self.add(start_bit, idle_mask, cover, wants_pass, wants_vac, expand);
+        self.mons[j].env = Some(Box::new(e));
+        Ok(j)
+    }
+
+    /// Attempts in flight of a local-variable monitor: ((sid, envs, count,
+    /// start ticks), ...).
+    fn peek_env(&self, py: Python<'_>, j: usize) -> PyResult<PyObject> {
+        let list = PyList::empty(py);
+        if let Some(e) = &self.mons[j].env {
+            for t in e.toks.iter() {
+                list.append((t.sid, t.env.clone_ref(py), t.meta.count, PyTuple::new(py, t.meta.starts())?))?;
+            }
+        }
+        Ok(list.into_any().unbind())
     }
 
     /// Number of phase A atoms (the atoms idle states read; always passed).
@@ -436,16 +483,30 @@ impl Kernel {
     /// events pending; bit 1: an attempt stayed in flight (its start time is
     /// needed); bit 2: some monitor is not sleepable; bits 3..: the phase B
     /// words tick_b needs.
-    fn tick_a(&mut self, py: Python<'_>, a: Vec<u64>, tick: u64) -> PyResult<u64> {
+    #[pyo3(signature = (a, tick, args=None))]
+    fn tick_a(&mut self, py: Python<'_>, a: Vec<u64>, tick: u64, args: Option<Py<PyTuple>>) -> PyResult<u64> {
         self.busy.clear();
         self.started = false;
         self.a = a;
+        self.args = args;
         let na = self.na;
         let mut need: u64 = 0;
         for j in 0..self.mons.len() {
             let m = &self.mons[j];
             let st = &m.st;
             if !st.active {
+                continue;
+            }
+            if let Some(e) = &m.env {
+                let idle = e.toks.is_empty();
+                if idle || st.bneed == 0 {
+                    let mask = if idle { e.idle_mask } else { e.all_mask };
+                    let key = gather(&st.amap, mask, na, &self.a, &[]);
+                    self.env_step(py, j, key, tick)?;
+                } else {
+                    need |= st.bneed;
+                    self.busy.push(j);
+                }
                 continue;
             }
             if st.state == 0 || st.bneed == 0 {
@@ -472,6 +533,11 @@ impl Kernel {
         let na = self.na;
         for &j in busy.iter() {
             let m = &self.mons[j];
+            if let Some(e) = &m.env {
+                let key = gather(&m.st.amap, e.all_mask, na, &self.a, &b);
+                self.env_step(py, j, key, tick)?;
+                continue;
+            }
             let key = gather(&m.st.amap, m.tab.need[m.st.state as usize], na, &self.a, &b);
             let key = key | self.mons[j].st.start(&self.a);
             self.step(py, j, key, tick)?;
@@ -533,9 +599,12 @@ impl Kernel {
 
     /// Drop the attempts in flight (back to the idle global state).
     fn reset(&mut self, j: usize) {
-        let st = &mut self.mons[j].st;
-        st.state = 0;
-        st.meta.clear();
+        let m = &mut self.mons[j];
+        m.st.state = 0;
+        m.st.meta.clear();
+        if let Some(e) = &mut m.env {
+            e.toks.clear();
+        }
     }
 
     /// Oldest start tick of any attempt in flight.
@@ -543,7 +612,10 @@ impl Kernel {
         self.mons
             .iter()
             .filter(|m| m.st.active)
-            .flat_map(|m| m.st.meta.iter().flat_map(|x| x.starts()))
+            .flat_map(|m| {
+                let env = m.env.iter().flat_map(|e| e.toks.iter().map(|t| &t.meta));
+                m.st.meta.iter().chain(env).flat_map(|x| x.starts())
+            })
             .min()
     }
 }

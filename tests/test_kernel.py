@@ -115,3 +115,51 @@ def test_kernel_matches_python_multiclock(quiet, monkeypatch):
         checked += 1
         in_kernel += k
     assert checked > 300 and in_kernel > 300
+
+
+@pytest.mark.parametrize("quiet", [False, True])
+@pytest.mark.parametrize("seed", range(3))
+def test_kernel_matches_python_local_variables(seed, quiet, monkeypatch):
+    """Local-variable assertions (symbolic stepping, attempts kept in the
+    kernel) give the same events, merge counts and counters in the kernel as
+    in Python, on random properties with several locals, reassignment,
+    conditions on locals and several threads per attempt."""
+    from test_symenv import SIGNALS as LSIGNALS
+    from test_symenv import LGen, _rows
+    monkeypatch.setattr(_engine, "SYMBOLIC", True)
+    monkeypatch.setattr(_trace._Sink, "wants_pass", not quiet)
+    monkeypatch.setattr(_trace._Sink, "wants_vacuous", not quiet)
+    rnd = random.Random(2000 + seed)
+    g = LGen(rnd)
+    checked = in_kernel = 0
+    for _ in range(120):
+        props, kinds = {}, {}
+        for k in range(rnd.randint(1, 3)):
+            props[f"p{k}"] = g.prop()
+            kinds[f"p{k}"] = rnd.choice(["assert", "assert", "cover"])
+        rows = _rows(rnd, rnd.randint(5, 50))
+        out = []
+        for kernel in (False, True):
+            saved = _engine._kmod
+            if not kernel:
+                _engine._kmod = None
+            try:
+                tr = _trace.TraceRun(props, LSIGNALS, kinds=kinds)
+                for r in rows:
+                    tr.step(r)
+                res = tr.finish()
+            except (SvaError, TypeError):
+                break
+            finally:
+                _engine._kmod = saved
+            events = {}
+            for e in res.events:
+                events.setdefault(e.assertion, []).append((e.kind, e.tick, e.starts, e.count))
+            out.append((events, res.stats))
+            if kernel:
+                in_kernel += sum(m._k is not None for m in tr.mons)
+        if len(out) < 2:
+            continue
+        assert out[1] == out[0], f"{props}\n{rows}"
+        checked += 1
+    assert checked > 60 and in_kernel > 60

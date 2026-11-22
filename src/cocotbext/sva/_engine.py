@@ -595,6 +595,8 @@ class Monitor:
     def idle_slots(self):
         """(slots, xslots) the idle state reads each tick."""
         if self.prog.envmode:
+            if self._k is not None:          # (asked while idle)
+                return self.prog.slots_of(self.idle_need())
             if self._sym is not None and not self.tokens:
                 return self.prog.slots_of(self.idle_need())
             return self.prog.all_slots()
@@ -625,6 +627,11 @@ class Monitor:
     # -- end of test --------------------------------------------------------
     def pending(self):
         """[(term, meta)] of attempts still in flight."""
+        if self.prog.envmode and self._k is not None:
+            t_of = self._k.time_of
+            term = self._sym.term
+            return [(term(sid, E), (count, tuple((t, t_of(t)) for t in ticks)))
+                    for sid, E, count, ticks in self._k.K.peek_env(self._kj)]
         if self.prog.envmode:
             if self._sym is not None:
                 term = self._sym.term
@@ -645,10 +652,10 @@ class Monitor:
                 self.n_failures += meta[0]
                 self.n_pending_fail += meta[0]
                 self.sink(FAIL, self, meta[0], meta[1], tickno, at_end=True)
-        if self.prog.envmode:
-            self.tokens = {}
-        elif self._k is not None:
+        if self._k is not None:
             self._k.K.reset(self._kj)
+        elif self.prog.envmode:
+            self.tokens = {}
         else:
             self.gs = self._gstate(())
             self.meta = ()
@@ -656,13 +663,22 @@ class Monitor:
     def kill(self):
         """$assertkill: drop attempts in flight without verdicts."""
         self.settle()
-        if self.prog.envmode:
-            self.tokens = {}
-        elif self._k is not None:
+        if self._k is not None:
             self._k.K.reset(self._kj)
+        elif self.prog.envmode:
+            self.tokens = {}
         else:
             self.gs = self._gstate(())
             self.meta = ()
+
+    def _kstep(self, sid, E, bits, args):
+        """Step of a local-variable attempt for the compiled kernel, on a
+        branch of the transition tree not built yet: (verdict, next sid, next
+        envs, the tree of (sid, bits) after the step, for the kernel to
+        mirror)."""
+        sym = self._sym
+        v, sid2, E2 = sym.step(sid, E, bits, args)
+        return v, sid2, E2, sym.trans[sid][bits & sym.need[sid]]
 
 
 class Endpoint:
@@ -741,9 +757,16 @@ class KernelDomain:
 
     def register(self, m):
         st = m.sink
-        m._kj = self.K.add(m._start_bit if m._enabled else 0, m._gs_list[0].need,
-                           m.prog.kind == "cover", bool(getattr(st, "wants_pass", False)),
-                           m._sink_vac, m._kexpand)
+        cover, wants_pass = m.prog.kind == "cover", bool(getattr(st, "wants_pass", False))
+        if m.prog.envmode:
+            sym = m._sym
+            m._kj = self.K.add_env(m._start_bit if m._enabled else 0, cover, wants_pass, m._sink_vac,
+                                   sym.init_sid, sym.init_envs, m.idle_need(),
+                                   (1 << len(m.prog.atoms)) - 1, m.prog.disable_bit, m._kstep,
+                                   sym.need.__getitem__, sym.canonical)
+        else:
+            m._kj = self.K.add(m._start_bit if m._enabled else 0, m._gs_list[0].need, cover,
+                               wants_pass, m._sink_vac, m._kexpand)
         if not m._enabled:
             self.K.set_enabled(m._kj, False)
         m._k = self
@@ -781,11 +804,17 @@ def make_kernel(domain):
 
 
 def _kernel_eligible(m, step):
-    if len(m.prog.atoms) > 63 or m.prog.envmode:
+    if len(m.prog.atoms) > 63:
         return False
+    if m.prog.envmode:                 # local variables: symbolic stepping in the kernel
+        if m._sym is None or not hasattr(_kmod.Kernel, "add_env"):
+            return False
+        tick = Monitor.tick_env
+    else:
+        tick = Monitor.tick
     if type(step) is GatedStep:        # multi-clock: needs a kernel that gates starts
         return step.mon is m and not step.once and hasattr(_kmod.Kernel, "set_gate")
-    return getattr(step, "__func__", None) is Monitor.tick and step.__self__ is m
+    return getattr(step, "__func__", None) is tick and step.__self__ is m
 
 
 def _gate_code(step):
@@ -897,7 +926,7 @@ def _kernel_part(entries, kd, ns, total):
             a_idx[code.text] = len(a_codes)
             a_codes.append(code)
     for m in mons:
-        need0 = m._gs_list[0].need
+        need0 = m.idle_need() if m.prog.envmode else m._gs_list[0].need
         for i, code in enumerate(m.prog.atoms):
             if need0 >> i & 1 and code.text not in a_idx:
                 a_idx[code.text] = len(a_codes)
@@ -943,7 +972,9 @@ def _kernel_part(entries, kd, ns, total):
     ns.update(KA=kd.K.tick_a, KB=kd.K.tick_b, KD=kd.dispatch, KT=kd.times, KN=kd.domain.now,
               KP=kd.prune, KDOM=kd)
     atuple = "(" + "".join(f"ka{w}, " for w in range(len(awords))) + ")"
-    lines += [f"    r = KA({atuple}, t)",
+    # local-variable monitors compute local values from the signals
+    args = ", (c, R, cx, RX, H)" if any(m.prog.envmode for m in mons) else ""
+    lines += [f"    r = KA({atuple}, t{args})",
               "    if r & 4:",
               "        n = 1",
               "    if r > 7 or r & 1:"]
