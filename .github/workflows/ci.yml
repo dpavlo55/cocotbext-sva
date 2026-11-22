@@ -1,0 +1,132 @@
+# Tests on every push and pull request:
+#   unit     - unit tests, corpora and fuzzing (no simulator), with the compiled
+#              kernel and in pure Python, on Linux, Windows and macOS
+#   sims     - end-to-end tests on nvc, GHDL, Icarus and Verilator (Linux),
+#              with the kernel and in pure Python
+#   windows  - end-to-end tests on nvc (Windows)
+# Everything runs through the same nox sessions as locally.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NVC_VERSION: "1.23.1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install the package and the development tools
+        run: python -m pip install -r requirements.txt
+      - name: Build and install the compiled kernel
+        shell: bash
+        run: |
+          python -m maturin build --release --out dist -m kernel/Cargo.toml
+          python -m pip install --no-index --find-links dist cocotbext-sva-kernel
+      - name: Unit tests (kernel, then pure Python)
+        run: python -m nox -s tests
+
+  sims:
+    name: simulators (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # A virtualenv, so that the Python of OSS CAD Suite (on PATH below) is
+      # never the one that runs the tests.
+      - name: Install the package, the development tools and the kernel
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m maturin build --release --out dist -m kernel/Cargo.toml
+          .venv/bin/python -m pip install --no-index --find-links dist cocotbext-sva-kernel
+      - name: Install nvc
+        run: |
+          deb="nvc_${NVC_VERSION}-1_amd64_ubuntu-24.04.deb"
+          curl -fsSLO "https://github.com/nickg/nvc/releases/download/r${NVC_VERSION}/${deb}"
+          sudo apt-get update
+          sudo apt-get install -y "./${deb}" liblz4-dev   # (lz4: Verilator's FST writer)
+          nvc --version
+      - name: Install GHDL, Icarus and Verilator (OSS CAD Suite)
+        uses: YosysHQ/setup-oss-cad-suite@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Use cocotb's Python with OSS CAD Suite's vvp
+        # The suite's vvp wrapper sets PYTHONHOME to its bundled Python, which
+        # breaks cocotb in the virtualenv: run the same binary without it.
+        run: |
+          suite="$(dirname "$(dirname "$(command -v iverilog)")")"
+          mkdir -p "$HOME/shims"
+          printf '#!/usr/bin/env bash\nexec "%s/lib/ld-linux-x86-64.so.2" --inhibit-cache --inhibit-rpath "" --library-path "%s/lib" "%s/libexec/vvp" "$@"\n' \
+            "$suite" "$suite" "$suite" > "$HOME/shims/vvp"
+          chmod +x "$HOME/shims/vvp"
+          echo "$HOME/shims" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Simulator versions
+        run: |
+          which python vvp
+          ghdl --version | head -1
+          iverilog -V 2>&1 | head -1
+          verilator --version
+      - name: Smoke test
+        run: python -m nox -s smoke -- nvc ghdl icarus verilator
+      - name: End-to-end tests with the kernel
+        run: python -m nox -s simtests -- nvc ghdl icarus verilator
+      - name: End-to-end tests in pure Python
+        env:
+          COCOTBEXT_SVA_KERNEL: python
+        run: python -m nox -s simtests -- nvc ghdl icarus verilator
+
+  windows:
+    name: nvc (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install the package, the development tools and the kernel
+        shell: bash
+        run: |
+          python -m pip install -r requirements.txt
+          python -m maturin build --release --out dist -m kernel/Cargo.toml
+          python -m pip install --no-index --find-links dist cocotbext-sva-kernel
+      - name: Install nvc
+        shell: pwsh
+        run: |
+          $msi = "nvc-$env:NVC_VERSION.msi"
+          Invoke-WebRequest "https://github.com/nickg/nvc/releases/download/r$env:NVC_VERSION/$msi" -OutFile $msi
+          Start-Process msiexec.exe -Wait -ArgumentList "/i", $msi, "/quiet", "/norestart"
+          $exe = Get-ChildItem -Path "$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:LOCALAPPDATA\Programs" `
+                   -Filter nvc.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "nvc.exe not found after installing $msi" }
+          $exe.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $exe.FullName --version
+      - name: End-to-end tests
+        run: python -m nox -s simtests -- nvc

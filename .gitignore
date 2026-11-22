@@ -17,3 +17,4 @@ build/
 *.out
 *.prof
 kernel/target/
+dist/

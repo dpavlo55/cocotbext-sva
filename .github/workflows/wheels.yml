@@ -1,0 +1,145 @@
+# Distributions: the pure-Python package (wheel and sdist) and abi3 wheels of
+# the compiled kernel (one per platform, for every Python >= 3.10), uploaded
+# as workflow artifacts. Runs on version tags, on demand, and when the kernel
+# or the packaging changes. Publishing to PyPI is not set up here.
+name: Wheels
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "kernel/**"
+      - "pyproject.toml"
+      - ".github/workflows/wheels.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: cocotbext-sva (wheel, sdist)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          python -m pip install build
+          python -m build --outdir dist
+      - name: Check that the wheel installs and imports
+        run: |
+          python -m venv /tmp/check
+          /tmp/check/bin/pip install dist/*.whl
+          /tmp/check/bin/python -c "import cocotbext.sva as s; print(s.__name__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-cocotbext-sva
+          path: dist/*
+
+  kernel-linux:
+    name: kernel (Linux ${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: kernel
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-kernel-linux-${{ matrix.target }}
+          path: kernel/dist/*.whl
+
+  kernel-windows:
+    name: kernel (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: kernel
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-kernel-windows-x64
+          path: kernel/dist/*.whl
+
+  kernel-macos:
+    name: kernel (macOS ${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: kernel
+          target: ${{ matrix.target }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-kernel-macos-${{ matrix.target }}
+          path: kernel/dist/*.whl
+
+  kernel-sdist:
+    name: kernel (sdist)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: kernel
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-kernel-sdist
+          path: kernel/dist/*.tar.gz
+
+  # The built kernel wheel must pass the kernel tests on its platform.
+  kernel-test:
+    name: kernel wheel test (${{ matrix.os }})
+    needs: [kernel-linux, kernel-windows, kernel-macos]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: dist-kernel-linux-x86_64
+          - os: windows-latest
+            artifact: dist-kernel-windows-x64
+          - os: macos-latest
+            artifact: dist-kernel-macos-aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"       # abi3: the oldest supported Python
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: wheels
+      - name: Install and test
+        shell: bash
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install --no-index --find-links wheels cocotbext-sva-kernel
+          COCOTBEXT_SVA_KERNEL=native python -m pytest -q tests/test_kernel.py tests/test_offline.py
