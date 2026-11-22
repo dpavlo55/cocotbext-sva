@@ -6,10 +6,11 @@
 </p>
 
 <p align="center">
+  <a href="https://pypi.org/project/cocotbext-sva/"><img alt="PyPI" src="https://img.shields.io/pypi/v/cocotbext-sva?logo=pypi&logoColor=white"></a>
   <a href="https://cocotbext-sva.readthedocs.io/en/latest/"><img alt="Documentation" src="https://img.shields.io/readthedocs/cocotbext-sva?logo=readthedocs&logoColor=white&label=docs"></a>
   <a href="https://github.com/dpavlo55/cocotbext-sva/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/dpavlo55/cocotbext-sva/ci.yml?branch=main&logo=github&label=CI"></a>
   <a href="https://github.com/dpavlo55/cocotbext-sva/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
-  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white">
+  <a href="https://pypi.org/project/cocotbext-sva/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/cocotbext-sva?logo=python&logoColor=white"></a>
   <img alt="cocotb 2.x" src="https://img.shields.io/badge/cocotb-2.x-blue">
 </p>
 
