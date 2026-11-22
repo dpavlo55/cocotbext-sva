@@ -415,7 +415,7 @@ class _Domain:
 
         A start-of-step callback is only ever registered from the read-write
         phase, so none is pending when a test ends at a clock edge or a
-        timer. Measured (phase4-results.md): on Verilator, removing one that
+        timer. Measured (docs/notes.md): on Verilator, removing one that
         was registered from inside a start-of-step callback crashes the
         simulator, and so does ending the simulation in a time step in which
         one was registered, removed or not; GHDL crashes at the end if one is

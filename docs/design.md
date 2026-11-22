@@ -213,13 +213,13 @@ end-to-end test comparing a sleeping and a non-sleeping domain on the same
 clock (identical failures and counters) on every simulator. Counting the
 slept edges with raw GPI callbacks instead of the trigger callback was tried
 in phase 3 and not adopted: it cannot be both exact and safe at the end of
-the simulation on every simulator (`phase3-results.md`, 3.4).
+the simulation on every simulator.
 
 ## 6. Sampling semantics
 
 SVA samples values in the Preponed region — before the clock edge's updates.
 
-Measured in phase 0 on every simulator (see `phase0-results.md` §1):
+Measured on every simulator:
 
 - **Clock driven from cocotb** (`cocotb.clock.Clock`, GPI or Python
   implementation): reads at the edge callback return pre-edge values on every
@@ -231,7 +231,7 @@ Measured in phase 0 on every simulator (see `phase0-results.md` §1):
   event-driven simulators, post-edge on Verilator (callbacks run after `eval()`).
 - **Preponed sampling (phase 4).** A read at the start of the time step
   (`NextTimeStep` callback) returns pre-edge values for every clock kind on
-  every simulator (`phase4-results.md` §1). Each clocking event has a sampling
+  every simulator (`notes.md`, "Simulators"). Each clocking event has a sampling
   mode: `edge`, `preponed` (snapshot of every signal of the domain at the
   start of each time step; a tick uses the snapshot of its own time step) or
   `auto`, the default: both for the first 256 ticks, `preponed` from the
@@ -343,8 +343,7 @@ the LRM leaves room, otherwise by the LRM:
 Known differences from the reference implementation are listed with reasons
 in `tests/test_corpus.py`. In every one of them the engine agrees with the
 reference interpreter (formal semantics plus the decisions above), or the
-difference comes from contradiction pruning; see `phase2-results.md` for the
-classes.
+difference comes from contradiction pruning; `notes.md` lists the classes.
 
 ## 10. Verification strategy
 
@@ -378,7 +377,7 @@ trace and added to the regression suite.
 | 1 | One sampling loop per clocking event; lazy DFA; each signal read at most once per cycle; demand-driven reads | 1 |
 | 2 | Fast read path: low-level GPI reads instead of `.value` (5–10× cheaper for narrow signals). Reader chosen per (GPI interface, object type) from a calibrated table, never by probing a live value: VPI ≤ 32 bits → GPI long (masked to unsigned); VHPI any width and anything > 32 bits → GPI binary string. Private cocotb API isolated in one adapter module with a public-API fallback and a per-simulator self-test in CI | 1 |
 | 3 | Idle sleep | 2 |
-| 4 | Optional compiled kernel (Rust/PyO3, abi3 wheels, separate distribution) with pure-Python fallback — built in phase 3 because the pure-Python busy cost stayed above target (see `phase3-results.md`) | 3 |
+| 4 | Optional compiled kernel (Rust/PyO3, abi3 wheels, separate distribution) with pure-Python fallback — built in phase 3 because the pure-Python busy cost stayed above target | 3 |
 | 5 | `TraceSampler` offline mode on FST/VCD dumps (zero simulation overhead) | 3 |
 | 6 | `ProbeSampler`: generated HDL wrapper (VHDL-2008 external names / Verilog hierarchical references), one packed read per cycle, optional HDL-side batching (reports delayed by ≤ N cycles, failure time still exact) | 4 |
 
@@ -429,10 +428,10 @@ assertion per cycle.
 
 ## 13. Phases
 
-0. **Calibration and benchmarks** — done, see `phase0-results.md`.
-   Phase 1 — done, see `phase1-results.md`.
-   Phase 2 — done, see `phase2-results.md`.
-   Phase 3 — done, see `phase3-plan.md` and `phase3-results.md`.
+Phases 0 to 4 are done; differences, simulator findings and measurements
+are in `notes.md`.
+
+0. **Calibration and benchmarks.**
 1. **Core:** parser + IR, NFA + lazy DFA, `EdgeSampler` with demand-driven
    reads, immediate + deferred assertions, sampled-value functions, all
    sequence operators, implications, `disable iff`, clocking events with `iff`,
@@ -443,7 +442,7 @@ assertion per cycle.
    statistics, vacuity warnings; idle sleep.
 3. **Speed:** optional compiled kernel, offline `TraceSampler`.
 4. **Clocking extensions:** `PreponedSampler`, multi-clock sequences,
-   `.triggered` / `.ended`, `ProbeSampler`: done, see `phase4-results.md`.
+   `.triggered` / `.ended`, `ProbeSampler`.
 5. **Later:** library of ready-made checkers (moved out of phase 4). CI and
    wheels: workflows written (§12); releases: `docs/release.md`.
 
