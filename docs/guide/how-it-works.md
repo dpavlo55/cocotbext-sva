@@ -33,9 +33,23 @@ simulator at all.
 
 ## Attempts: a new one at every tick
 
-```{image} img/attempts.svg
+```{wavedrom}
 :alt: A timing diagram of req, ack and the attempts of the property. The attempt started at tick 1 passes at tick 3; the one started at tick 5 fails at tick 8; the others are vacuous.
-:width: 100%
+{ "signal": [
+    { "name": "tick", "wave": "2222222222", "data": ["0","1","2","3","4","5","6","7","8","9"] },
+    { "name": "clk",  "wave": "n........." },
+    { "name": "req",  "wave": "010..10..." },
+    { "name": "ack",  "wave": "0..10....." },
+    {},
+    [ "attempts",
+      { "name": "from tick 1", "wave": "x7..x.....", "data": ["✓ ack at tick 3: pass"] },
+      { "name": "from tick 5", "wave": "x....9...x", "data": ["✗ no ack at ticks 6 to 8: fail at 8"] },
+      { "name": "other ticks", "wave": "2x222x2222", "data": ["v","v","v","v","v","v","v","v"] }
+    ]
+  ],
+  "config": { "hscale": 2 },
+  "foot": { "text": "v: vacuous attempt (req = 0, nothing to check)" }
+}
 ```
 
 A concurrent assertion is not checked once: SVA starts a new *attempt* of the
@@ -45,7 +59,8 @@ passes or fails.
 For `req |-> ##[1:3] ack`, an attempt that starts while `req` is 0 has
 nothing to check; it succeeds at once and is called *vacuous*. An attempt
 that starts while `req` is 1 waits for `ack` in a window of 1 to 3 ticks
-later. Above, the attempt from tick 1 sees `ack` at tick 3 and passes; the
+later. Above (each clock tick is the rising edge in the middle of its
+numbered box), the attempt from tick 1 sees `ack` at tick 3 and passes; the
 attempt from tick 5 reaches the end of its window at tick 8 without `ack` and
 fails. The failure is reported at tick 8, with the time the attempt started.
 
