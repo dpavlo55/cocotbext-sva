@@ -1,6 +1,6 @@
 [package]
 name = "cocotbext-sva-kernel"
-version = "0.1.0-dev0"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Optional compiled evaluation kernel for cocotbext-sva"

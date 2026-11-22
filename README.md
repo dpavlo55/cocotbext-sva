@@ -26,7 +26,7 @@ SystemVerilog-style **immediate and concurrent (temporal) assertions** for
 [cocotb](https://www.cocotb.org) testbenches, written in SVA syntax. Works
 with VHDL and Verilog designs.
 
-Status: in development (not released). Requires cocotb 2.x and Python 3.10+.
+Status: alpha (0.1.0, the first release). Requires cocotb 2.x and Python 3.10+.
 
 ```python
 import cocotb

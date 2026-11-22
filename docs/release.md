@@ -59,7 +59,10 @@ it already has: change the version (e.g. `0.1.0.dev1`) to try again.
 ## Release
 
 1. Set the same version in `pyproject.toml` and `kernel/pyproject.toml`
-   (`0.1.0`, `0.1.1`, ...), and in `kernel/Cargo.toml`. Commit.
+   (`0.1.0`, `0.1.1`, ...), and in `kernel/Cargo.toml` and `kernel/Cargo.lock`
+   (the `cocotbext-sva-kernel` entry). Commit. `cocotbext.sva.__version__`
+   is read from the installed distribution, and the kernel's from
+   `Cargo.toml`, so there is nothing else to change.
 2. Tag and push:
 
    ```bash

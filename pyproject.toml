@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cocotbext-sva"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "SystemVerilog-style immediate and concurrent assertions for cocotb"
 readme = "README.md"
 license = "MIT"
@@ -13,9 +13,19 @@ authors = [{ name = "David Pavlović" }]
 requires-python = ">=3.10"
 dependencies = ["cocotb>=2.0,<3"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
     "Framework :: cocotb",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+    "Topic :: Software Development :: Testing",
 ]
 
 [project.urls]
