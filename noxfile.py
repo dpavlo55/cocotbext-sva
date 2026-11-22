@@ -106,6 +106,7 @@ def simtests(session):
     _run_everywhere(session, "tests/sim/run_clocks.py")
     _run_everywhere(session, "tests/sim/run_probe.py")
     _run_everywhere(session, "tests/sim/run_offline.py")
+    _run_everywhere(session, "examples/getting_started/run.py")   # the docs' example
 
 
 @nox.session(python=False)

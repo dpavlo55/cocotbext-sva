@@ -1,5 +1,7 @@
 # cocotbext-sva
 
+[![Documentation](https://readthedocs.org/projects/cocotbext-sva/badge/?version=latest)](https://cocotbext-sva.readthedocs.io/en/latest/)
+
 > **Note:** this package was implemented with [Claude Code](https://claude.com/claude-code),
 > and its results were validated against a commercial SVA simulator.
 
@@ -39,7 +41,7 @@ the sampled values:
 - **The SVA property language:** sequences, implications, local variables,
   `$past` and the other sampled-value functions, `always` / `eventually` /
   `until`, `disable iff`, `accept_on`, `cover`, `expect`, immediate
-  assertions ([full list](https://github.com/dpavlo55/cocotbext-sva/blob/main/docs/guide.md#supported-sva)).
+  assertions ([full list](https://cocotbext-sva.readthedocs.io/en/latest/guide.html#supported-sva)).
 - **Several clocks:** clocks generated or derived in the HDL (exact SVA
   sampling), and multi-clock properties (`req |=> @(posedge clk_b) ack_b`).
 - **Reuse:** parameterised properties, named sequences, checkers bound to
@@ -67,15 +69,21 @@ pip install cocotbext-sva[fast]      # with the compiled kernel (same results, f
   a commercial SVA implementation, and fuzzed against a reference
   interpreter of the IEEE 1800 formal semantics. Where the commercial tool
   and the standard disagree, the package follows the standard; the cases are
-  listed in [docs/notes.md](https://github.com/dpavlo55/cocotbext-sva/blob/main/docs/notes.md).
+  listed in the [notes](https://cocotbext-sva.readthedocs.io/en/latest/notes.html).
 
 ## Documentation
 
-- [User guide](https://github.com/dpavlo55/cocotbext-sva/blob/main/docs/guide.md): writing assertions, clocks and sampling,
-  `Probe`, offline checking, semantics notes, speed.
-- [Notes](https://github.com/dpavlo55/cocotbext-sva/blob/main/docs/notes.md): differences from the reference implementation,
-  simulator-specific behaviour, measurements.
-- [Design](https://github.com/dpavlo55/cocotbext-sva/blob/main/docs/design.md): architecture. [Releasing](https://github.com/dpavlo55/cocotbext-sva/blob/main/docs/release.md).
+The full documentation is at **https://cocotbext-sva.readthedocs.io**:
+
+- [Getting started](https://cocotbext-sva.readthedocs.io/en/latest/getting-started.html):
+  a first test with assertions, in five minutes.
+- [User guide](https://cocotbext-sva.readthedocs.io/en/latest/guide.html): writing assertions,
+  clocks and sampling, `Probe`, offline checking, semantics notes, speed.
+- [API reference](https://cocotbext-sva.readthedocs.io/en/latest/api.html): every class and function.
+- [Notes](https://cocotbext-sva.readthedocs.io/en/latest/notes.html): differences from the
+  reference implementation, simulator-specific behaviour, measurements.
+- [Design](https://cocotbext-sva.readthedocs.io/en/latest/design.html): architecture.
+  [Releasing](https://cocotbext-sva.readthedocs.io/en/latest/release.html).
 
 ## Development
 

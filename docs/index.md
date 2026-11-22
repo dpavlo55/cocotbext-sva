@@ -26,10 +26,13 @@ pip install cocotbext-sva            # pure Python
 pip install cocotbext-sva[fast]      # with the compiled kernel (same results, faster)
 ```
 
+New here? Start with [Getting started](getting-started.md).
+
 ```{toctree}
 :caption: User guide
 :maxdepth: 2
 
+getting-started
 guide
 ```
 
