@@ -27,7 +27,7 @@ Out of scope for now: PSL syntax, `checker` blocks, formal verification.
 | R4 | cocotb 2.x only | No 1.x compatibility layer; use the 2.x value and trigger APIs |
 | R5 | Direct mode (no HDL changes) is the default | Correct sampling and fast reads must be achieved from Python alone |
 | R6 | Works on nvc, GHDL, Verilator, Icarus (and other cocotb-supported simulators) | Per-simulator calibration tests; CI matrix |
-| R7 | Open-source package for everyone | Must handle many clock domains, both edges, VHDL and Verilog conventions; BSD-3-Clause |
+| R7 | Open-source package for everyone | Must handle many clock domains, both edges, VHDL and Verilog conventions; MIT license |
 | R8 | SVA syntax only (for now) | Hand-written SVA parser; internal representation is syntax-neutral |
 
 ## 3. Architecture overview
@@ -398,7 +398,7 @@ assertion per cycle.
 
 ## 12. Packaging and development
 
-- Distribution `cocotbext-sva`, import `cocotbext.sva`, BSD-3-Clause.
+- Distribution `cocotbext-sva`, import `cocotbext.sva`, MIT license.
 - Pure-Python wheel; only runtime dependency is cocotb 2.x.
 - Optional compiled kernel: separate distribution `cocotbext-sva-kernel`
   (`kernel/`, Rust + PyO3, abi3 wheels built with maturin), import
@@ -421,7 +421,8 @@ assertion per cycle.
   Windows. `wheels.yml` (tags, on demand, kernel changes): the pure-Python
   wheel and sdist, the kernel's abi3 wheels for Linux x86_64/aarch64
   (manylinux), Windows x64 and macOS x86_64/arm64, and a test of each
-  native wheel on Python 3.10. Publishing to PyPI is not automated.
+  native wheel on Python 3.10. A `v*` tag uploads both projects to PyPI by
+  trusted publishing (`docs/release.md`).
 - Simulator matrix: nvc, GHDL, Verilator, Icarus on Linux; nvc on Windows.
   Other cocotb-supported simulators are expected to work through the same
   cocotb interfaces.
@@ -444,8 +445,7 @@ assertion per cycle.
 4. **Clocking extensions:** `PreponedSampler`, multi-clock sequences,
    `.triggered` / `.ended`, `ProbeSampler`: done, see `phase4-results.md`.
 5. **Later:** library of ready-made checkers (moved out of phase 4). CI and
-   wheels: workflows written (§12), not yet run on GitHub; publishing to
-   PyPI not set up.
+   wheels: workflows written (§12); releases: `docs/release.md`.
 
 ## Appendix A — API sketch (not implemented)
 
