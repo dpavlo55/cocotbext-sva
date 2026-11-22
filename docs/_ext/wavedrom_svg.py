@@ -45,14 +45,16 @@ class WaveDrom(SphinxDirective):
 
     def run(self):
         source = "\n".join(self.content)
-        name = f"wavedrom-{hashlib.sha1(source.encode()).hexdigest()[:12]}.svg"
-        images = Path(self.env.app.outdir) / "_images"
-        images.mkdir(parents=True, exist_ok=True)
         try:
-            svg = wavedrom.render(source).tostring()
+            svg = restyle(wavedrom.render(source).tostring())
         except Exception as e:  # invalid WaveJSON: a build error at this line
             raise self.error(f"wavedrom: {e}") from e
-        (images / name).write_text(restyle(svg), encoding="utf-8")
+        # named after the finished drawing: a change of source or of style is a
+        # new URL, so browsers do not keep showing a cached old version
+        name = f"wavedrom-{hashlib.sha1(svg.encode()).hexdigest()[:12]}.svg"
+        images = Path(self.env.app.outdir) / "_images"
+        images.mkdir(parents=True, exist_ok=True)
+        (images / name).write_text(svg, encoding="utf-8")
         up = "../" * self.env.docname.count("/")
         alt = self.options.get("alt", "timing diagram").replace('"', "&quot;")
         html = f'<div class="wavedrom"><img src="{up}_images/{name}" alt="{alt}"></div>'

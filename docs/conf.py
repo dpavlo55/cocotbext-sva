@@ -19,6 +19,7 @@ extensions = [
     "sphinx.ext.viewcode",
     "sphinx_copybutton",
     "wavedrom_svg",           # ```{wavedrom} timing diagrams (_ext/wavedrom_svg.py)
+    "cache_bust",             # image URLs change with their content (_ext/cache_bust.py)
 ]
 
 source_suffix = {".md": "markdown"}
