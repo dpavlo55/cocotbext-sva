@@ -406,8 +406,13 @@ assertion per cycle.
   automatically when importable; `COCOTBEXT_SVA_KERNEL=python|native|auto`.
   It holds the per-tick state of fast-path assertions (transition tables,
   attempts in flight, counters); the transition semantics stay in Python
-  (the kernel calls back on a cache miss). Both engines run the full test
-  suite, and a differential test requires identical results.
+  (the kernel calls back on a cache miss). Multi-clock assertions are
+  fast-path assertions whose attempts start only at the ticks of the leading
+  clock (a gate atom). Local-variable assertions keep their attempts (shape,
+  envs as Python objects) in the kernel, which mirrors the cached decision
+  trees and calls the generated Python functions for local values. Both
+  engines run the full test suite, and differential tests require identical
+  results.
 - `nox` is the single task runner on Windows, WSL/Linux and CI.
 - Simulator matrix: nvc, GHDL, Verilator, Icarus on Linux; nvc on Windows.
   Other cocotb-supported simulators are expected to work through the same
