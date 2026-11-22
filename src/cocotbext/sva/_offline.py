@@ -285,6 +285,8 @@ class TraceSampler:
     VCD, or FST when the compiled kernel (cocotbext-sva[fast]) is installed
     (the format is detected from the file's content).
 
+    Example::
+
         ts = TraceSampler("waves.vcd", clock="posedge clk", scope="tb.dut",
                           disable_iff="!rst_n")
         ts.assert_property("req |-> ##[1:3] ack", name="req_ack")

@@ -19,6 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
+Documentation = "https://cocotbext-sva.readthedocs.io"
 Repository = "https://github.com/dpavlo55/cocotbext-sva"
 Issues = "https://github.com/dpavlo55/cocotbext-sva/issues"
 
