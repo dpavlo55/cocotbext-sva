@@ -94,6 +94,8 @@ def edge(signal, sampling: str | None = None) -> ClockingEvent:
 class Property:
     """A property (or sequence) with formal arguments, like an SV `property ... endproperty`.
 
+    Example::
+
         VALID_HELD = Property("valid && !ready |=> valid && $stable(data)",
                               args=("valid", "ready", "data"))
         a.assert_property(VALID_HELD(valid="in_valid", ready="in_ready", data=dut.in_data))
@@ -1900,6 +1902,8 @@ def checked(func):
 
 class Checker:
     """Reusable bundle of assertions with ports, like an SV checker bound with `bind`.
+
+    Example::
 
         class StreamChecker(Checker):
             ports = ("clk", "rst_n", "valid", "ready", "data")

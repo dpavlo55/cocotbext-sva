@@ -18,3 +18,4 @@ build/
 *.prof
 kernel/target/
 dist/
+docs/_build/

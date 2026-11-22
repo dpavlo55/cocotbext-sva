@@ -109,6 +109,14 @@ def simtests(session):
 
 
 @nox.session(python=False)
+def docs(session):
+    """Build the HTML documentation into docs/_build/html, warnings as errors
+    (as on Read the Docs). Install docs/requirements.txt first."""
+    session.run(sys.executable, "-m", "sphinx", "-W", "--keep-going", "-b", "html",
+                "docs", "docs/_build/html", *session.posargs, external=True)
+
+
+@nox.session(python=False)
 def smoke(session):
     """Minimal cocotb 2.x test on each simulator (VHDL and/or Verilog top)."""
     for sim in _selected_sims(session):
