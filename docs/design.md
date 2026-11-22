@@ -414,6 +414,14 @@ assertion per cycle.
   engines run the full test suite, and differential tests require identical
   results.
 - `nox` is the single task runner on Windows, WSL/Linux and CI.
+- CI: GitHub Actions. `ci.yml` (every push and pull request): unit tests on
+  Linux, Windows and macOS with Python 3.10 and 3.13, with the kernel and in
+  pure Python; end-to-end tests on nvc (pinned release), GHDL, Icarus and
+  Verilator (OSS CAD Suite) on Linux, in both engine modes, and on nvc on
+  Windows. `wheels.yml` (tags, on demand, kernel changes): the pure-Python
+  wheel and sdist, the kernel's abi3 wheels for Linux x86_64/aarch64
+  (manylinux), Windows x64 and macOS x86_64/arm64, and a test of each
+  native wheel on Python 3.10. Publishing to PyPI is not automated.
 - Simulator matrix: nvc, GHDL, Verilator, Icarus on Linux; nvc on Windows.
   Other cocotb-supported simulators are expected to work through the same
   cocotb interfaces.
@@ -435,8 +443,9 @@ assertion per cycle.
 3. **Speed:** optional compiled kernel, offline `TraceSampler`.
 4. **Clocking extensions:** `PreponedSampler`, multi-clock sequences,
    `.triggered` / `.ended`, `ProbeSampler`: done, see `phase4-results.md`.
-5. **Later:** library of ready-made checkers (moved out of phase 4), CI and
-   wheels (§12).
+5. **Later:** library of ready-made checkers (moved out of phase 4). CI and
+   wheels: workflows written (§12), not yet run on GitHub; publishing to
+   PyPI not set up.
 
 ## Appendix A — API sketch (not implemented)
 
