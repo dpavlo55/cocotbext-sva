@@ -71,6 +71,15 @@ class TraceBinder:
             self.channels.append((key, vfn, gfn, depth))
         return k
 
+    def endpoint_channel(self, key, fn):
+        """Channel whose value is computed at each tick (depth 0): the end
+        points of a sequence, for `.triggered`."""
+        k = self.channel_index.get(key)
+        if k is None:
+            k = self.channel_index[key] = len(self.channels)
+            self.channels.append((key, fn, None, 0))
+        return k
+
 
 @dataclass
 class Event:
@@ -172,6 +181,9 @@ class TraceRun:
         row = self.row
         for key, vfn, gfn, depth in self.binder.channels:
             init = None
+            if depth == 0:
+                self.hist.append(None)
+                continue
             if initial is not None:
                 row.clear()
                 row.update(initial)
@@ -191,6 +203,9 @@ class TraceRun:
         c = [None] * self.nslots
         cx = [None] * self.nx
         for k, (key, vfn, gfn, depth) in enumerate(self.binder.channels):
+            if depth == 0:
+                H[k] = vfn(c, R, cx, RX, H)
+                continue
             H[k] = hist[k][0]
             cur = vfn(c, R, cx, RX, H)
             if gfn is None or gfn(c, R, cx, RX, H):
@@ -236,7 +251,7 @@ def _multiclock(spec, text, binder, named, kind, clock, force):
     assertion evaluated on every row)."""
     from . import _ast as A
     from ._expr import ExprCompiler
-    from ._multiclock import Rewriter, has_clocks
+    from ._multiclock import Rewriter, uses_clocks
 
     def clock_id(ev):
         if not isinstance(ev.signal, A.Id):
@@ -244,7 +259,7 @@ def _multiclock(spec, text, binder, named, kind, clock, force):
         return ev.signal.name
 
     default = clock_id(spec.clock) if spec.clock is not None else clock
-    if not force and not has_clocks(spec.prop):
+    if not force and not uses_clocks(spec.prop, named):
         return spec, None
     if default is None:
         default = "<none>"
@@ -259,6 +274,7 @@ def _multiclock(spec, text, binder, named, kind, clock, force):
     # (also when every clocking event names the same clock: the rows are the
     # time steps of all the clocks of the trace, and this one may not tick in all)
     prop, lead = rw.rewrite(spec.prop, default)
+    named.update(rw.extra_named)
     return A.AssertionSpec(spec.clock, spec.disable, prop, span=spec.span), lead
 
 

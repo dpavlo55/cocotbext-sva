@@ -109,5 +109,6 @@ def test_errors():
         run_trace({"p": "req |-> akc"}, {"req": 1, "ack": 1}, [])
     with pytest.raises(SvaError, match="empty match"):
         run_trace({"p": "a[*0:1]"}, {"a": 1}, [])
-    with pytest.raises(SvaUnsupportedError):
-        run_trace({"p": "a |-> s.triggered"}, {"a": 1}, [], named={"s": "a ##1 a"})
+    with pytest.raises(SvaUnsupportedError, match="local variables"):
+        run_trace({"p": "a |-> s.triggered"}, {"a": 1, "x": 3}, [],
+                  named={"s": "(a, v = x) ##1 x == v"})

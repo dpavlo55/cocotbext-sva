@@ -219,7 +219,27 @@ class _Ctx(Resolver):
         return self.binder.history_channel(key, code, w, gcode, depth)
 
     def triggered_channel(self, name):
-        raise SvaUnsupportedError("'.triggered' is not supported yet")
+        """H slot of the end points of the named sequence (`name.triggered`)."""
+        from ._engine import Endpoint
+        d = self.named[name]
+        if d.args:
+            raise SvaUnsupportedError(f"'{name}.triggered': sequences with arguments are not supported")
+        if _assigned_locals(d.ast, self.named):
+            raise SvaUnsupportedError(f"'{name}.triggered': sequences with local variables are not supported")
+        busy = self.binder.__dict__.setdefault("_triggered_busy", set())
+        if name in busy:
+            raise SvaError(f"'{name}.triggered' is used inside sequence '{name}' itself")
+        busy.add(name)
+        try:
+            sub = Compiler(self.binder, d.text or self.text, self.named)
+            sub.ctx = _Ctx(self.binder, d.text or self.text, self.named, set())
+            sub.envmode = False
+            nfa = sub.nfa(d.ast)
+        finally:
+            busy.discard(name)
+        atoms = sub.ctx.atoms
+        bits = _gen_bits_fn(atoms, list(range(len(atoms))))
+        return self.binder.endpoint_channel(("triggered", name, id(d.ast)), Endpoint(nfa, bits))
 
     # atoms
     def atom(self, code: Code) -> tuple[bool, int]:
@@ -535,6 +555,9 @@ class Compiler:
             return b.with_actions(f, tuple(assigns))
         if isinstance(node, A.PSeq) and node.strength:
             raise SvaError(self._at(f"{node.strength}() is a property, not a sequence", node))
+        if isinstance(node, A.Clocked):
+            raise SvaUnsupportedError(self._at(
+                "a clocking event inside a sequence is not supported here", node))
         raise SvaError(self._at("expected a sequence", node))
 
     def _delay(self, make_left, lo, hi, right_node):

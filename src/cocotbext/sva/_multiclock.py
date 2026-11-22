@@ -43,6 +43,26 @@ def has_clocks(node) -> bool:
                for n in _walk(node))
 
 
+def uses_clocks(prop, named) -> bool:
+    """has_clocks, also looking into the named sequences and properties the
+    property uses (by name, as an instance, or through `.triggered`)."""
+    if has_clocks(prop):
+        return True
+    if not named:
+        return False
+    seen = set()
+    stack = [prop]
+    while stack:
+        for n in _walk(stack.pop()):
+            name = n.path[0] if isinstance(n, A.Id) else n.name if isinstance(n, A.Call) else None
+            if name in named and name not in seen:
+                seen.add(name)
+                if has_clocks(named[name].ast):
+                    return True
+                stack.append(named[name].ast)
+    return False
+
+
 def _walk(node):
     stack = [node]
     while stack:
@@ -91,6 +111,10 @@ class Rewriter:
         self.kind = kind
         self.text = text
         self.used: set = set()
+        # named sequences made here for `.triggered`: rewritten under the
+        # clock they are used with (add them to the compiler's named ones)
+        self.extra_named: dict = {}
+        self._triggered: dict = {}       # (sequence name, clock) -> name in extra_named
 
     # -- entry points ---------------------------------------------------------
     def analyse(self, prop, default):
@@ -196,6 +220,8 @@ class Rewriter:
                     for a in x.args:
                         if isinstance(a, A.ClockEvent):
                             self._use(self.clock_id(a))
+                elif self._is_triggered(x):
+                    self._collect(self.named[x.path[0]].ast, c)
             return
         if not isinstance(n, A.Node):
             return
@@ -213,11 +239,29 @@ class Rewriter:
                             if isinstance(x, A.Node):
                                 self._collect(x, c)
 
+    def _is_triggered(self, x) -> bool:
+        return (isinstance(x, A.Id) and len(x.path) == 2 and x.path[1] in ("triggered", "ended")
+                and x.path[0] in self.named)
+
     # -- expressions ----------------------------------------------------------
     def E(self, e, c):
         """Expression under clock c: sampled-value functions follow c's ticks."""
         if not isinstance(e, A.Node) or isinstance(e, A.ClockEvent):
             return e
+        if self._is_triggered(e):
+            # the end points of the sequence on its own clock (c unless it
+            # has a clocking event), seen at the union ticks
+            from ._compile import NamedDef
+            d = self.named[e.path[0]]
+            if d.args:
+                self.err(f"'{d.name}.triggered': sequences with arguments are not supported", e,
+                         SvaUnsupportedError)
+            name = self._triggered.get((d.name, c))
+            if name is None:
+                seq, _ = self.S(d.ast, c)
+                name = self._triggered[(d.name, c)] = f"{d.name}@{len(self.extra_named)}"
+                self.extra_named[name] = NamedDef(name, seq, (), d.text)
+            return A.Id((name, "triggered"), span=e.span)
         if isinstance(e, A.Call) and e.name == "$past":
             args = list(e.args) + [None] * (4 - len(e.args))
             cc = self._use(self.clock_id(args[3])) if isinstance(args[3], A.ClockEvent) else c

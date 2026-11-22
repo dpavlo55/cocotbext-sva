@@ -665,6 +665,24 @@ class Monitor:
             self.meta = ()
 
 
+class Endpoint:
+    """End points of a sequence, for `seq.triggered`: an attempt starts at
+    every tick, and the value at a tick is 1 if a match of some attempt ends
+    there. Called once per tick, before the assertions (it fills a slot of
+    H like a history channel)."""
+    __slots__ = ("nfa", "bits", "states")
+
+    def __init__(self, nfa, bits):
+        self.nfa = nfa
+        self.bits = bits
+        self.states = frozenset()
+
+    def __call__(self, c, R, cx, RX, H):
+        nfa = self.nfa
+        self.states, matched = nfa.step(self.states | nfa.init, self.bits(c, R, cx, RX, H))
+        return 1 if matched else 0
+
+
 class GatedStep:
     """Step function of a multi-clock assertion. Its domain ticks whenever
     one of the assertion's clocks does; attempts start only at ticks of the

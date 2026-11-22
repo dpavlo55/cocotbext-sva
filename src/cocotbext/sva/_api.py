@@ -22,7 +22,7 @@ from ._compile import Compiler, NamedDef, gen_value_fn, substitute
 from ._engine import GatedStep, Monitor, build_runner, make_kernel
 from ._errors import SvaError, SvaNameError
 from ._expr import ConstRef, ExprCompiler, Resolver, SignalRef
-from ._multiclock import Rewriter, has_clocks, strip_clocks
+from ._multiclock import Rewriter, has_clocks, strip_clocks, uses_clocks
 from ._parser import parse_assertion, parse_expression, parse_sequence_or_property
 from ._prop import FAIL, PASS
 
@@ -334,6 +334,19 @@ class _Domain:
             self.channel_slots.append((sl, xs))
         return k
 
+    def endpoint(self, key, fn) -> int:
+        """Channel computed at each tick before the assertions (ring None):
+        the end points of a sequence, for `.triggered`. The engine state it
+        holds changes at every tick, so the domain does not sleep."""
+        k = self.channel_of.get(key)
+        if k is None:
+            k = self.channel_of[key] = len(self.channels)
+            self.H.append(0)
+            self.channels.append((fn, None, None))
+            self.channel_slots.append((set(), set()))
+            self.idle_sleep = False
+        return k
+
     def now(self) -> int:
         if self._now_tick != self.tickno:
             self._now_tick = self.tickno
@@ -556,6 +569,9 @@ class _Domain:
         """Step the histories and the assertions on the values in the cache."""
         c, cx, H, R, RX = self.c, self.cx, self.H, self.R, self.RX
         for k, (vfn, gfn, ring) in enumerate(self.channels):
+            if ring is None:           # end points of a sequence (.triggered)
+                H[k] = vfn(c, R, cx, RX, H)
+                continue
             H[k] = ring[0]
             cur = vfn(c, R, cx, RX, H)
             if gfn is None or gfn(c, R, cx, RX, H):
@@ -889,6 +905,11 @@ class _Binder(Resolver):
             raise SvaError(f"X detection is not available for '{ref.label}'")
         return self.domain.xslot(handle)
 
+    def endpoint_channel(self, key, fn):
+        if self.domain is None or self.domain.key is None:
+            raise SvaError("'.triggered' needs a clock (not available in immediate assertions)")
+        return self.domain.endpoint(key, fn)
+
     def history_channel(self, key, code, width, gcode, depth):
         if self.domain is None:
             raise SvaError("sampled-value functions need a clock (not available in immediate assertions)")
@@ -1145,7 +1166,7 @@ class Assertions:
         named = dict(self.named)
         named.update(extra_named)
         lead_slot = None
-        if has_clocks(spec.prop) or _named_clocks(spec.prop, named):
+        if uses_clocks(spec.prop, named):
             spec, clock, domain, lead_slot = self._multiclock(spec, clock, overrides, named, kind, text)
         if lead_slot is None:
             clock_ev = self._clock_for(spec.clock, clock, overrides)
@@ -1227,6 +1248,7 @@ class Assertions:
         index = {cid: i for i, cid in enumerate(order)}
         rw.tick = lambda cid: A.Id((f"{_TICK}{index[cid]}",))
         prop, lead = rw.rewrite(spec.prop, default)
+        named.update(rw.extra_named)
         return (A.AssertionSpec(None, spec.disable, prop, span=spec.span), None, d,
                 d.tick_slots[index[lead]])
 
@@ -1602,33 +1624,6 @@ class Assertions:
     async def __aexit__(self, exc_type, exc, tb):
         self.finalize(raise_on_failure=exc_type is None)
         return False
-
-
-def _named_clocks(prop, named) -> bool:
-    """Does the property use a named sequence or property that has clocking
-    events of its own?"""
-    if not named:
-        return False
-    seen = set()
-    stack = [prop]
-    while stack:
-        n = stack.pop()
-        if not isinstance(n, A.Node):
-            continue
-        name = n.path[0] if isinstance(n, A.Id) and len(n.path) == 1 else \
-            n.name if isinstance(n, A.Call) else None
-        if name in named and name not in seen:
-            seen.add(name)
-            if has_clocks(named[name].ast):
-                return True
-            stack.append(named[name].ast)
-        for v in vars(n).values():
-            if isinstance(v, A.Node):
-                stack.append(v)
-            elif isinstance(v, list):
-                for item in v:
-                    stack += list(item) if isinstance(item, tuple) else [item]
-    return False
 
 
 def _fmt(v):

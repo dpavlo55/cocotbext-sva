@@ -338,3 +338,36 @@ async def test_same_clock_written_twice_is_single_clock(dut):
     assert h1.domain is h2.domain
     assert h1.stats == h2.stats and h1.stats["passes"] > 20
     assert h3.domain is not h1.domain and h3.domain.label.endswith("clk_int"), h3.domain.label
+
+
+@cocotb.test()
+async def test_triggered(dut):
+    """seq.triggered: on the clock of the sequence, and seen from a clock
+    that ticks in the same time step (clk_div with every other clk tick)."""
+    await setup(dut)
+    a = Assertions(dut, clock=posedge(dut.clk), name="trg")
+    a.sequence("pair", "req ##1 req")
+    a.sequence("pair_clk", "@(posedge clk) req ##1 req")
+    # same clock: the end of `pair` is req now and at the tick before (req_q)
+    fwd = a.assert_property("pair.triggered |-> req && req_q", name="fwd")
+    rev = a.assert_property("req && req_q |-> pair.triggered", name="rev")
+    cnt = a.cover_property("pair.ended", name="count")
+    late = a.assert_property("pair.triggered |=> !pair.triggered", name="late")      # fails: req 3 times
+    # from clk_div: only the ends in a time step where clk_div ticks are seen
+    dfwd = a.assert_property("@(posedge clk_div) pair_clk.triggered |-> req && req_q", name="dfwd")
+    drev = a.assert_property("@(posedge clk_div) req && req_q |-> pair_clk.triggered", name="drev")
+    rnd = random.Random(21)
+    rec = []
+    for _ in range(300):
+        r = int(rnd.random() < 0.5)
+        await cycle(dut, req=r)
+        rec.append((get_sim_time("ns"), r))
+    a.finalize(raise_on_failure=False)
+    assert {f.name for f in a.failures} == {"trg.late"}
+    ends = [i for i in range(1, len(rec)) if rec[i][1] and rec[i - 1][1]]
+    assert cnt.stats["hits"] == len(ends) and fwd.stats["passes"] == len(ends), (cnt.stats, len(ends))
+    assert rev.stats["passes"] == len(ends)
+    want = [rec[i][0] for i in ends if i - 1 in ends]
+    assert sorted(f.time for f in a.failures) == want
+    assert dfwd.stats["passes"] == drev.stats["passes"] and 20 < dfwd.stats["passes"] < len(ends)
+    assert dfwd.stats["vacuous"] + dfwd.stats["passes"] == dfwd.stats["attempts"]
