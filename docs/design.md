@@ -1,6 +1,6 @@
 # cocotbext-sva — design
 
-Status: phases 0 to 3 implemented, phase 4 in progress (see §13). This
+Status: phases 0 to 4 implemented (see §13). This
 document records the design decisions made before the first line of the
 package was written. It is the reference for contributors; update it when a
 decision changes.
@@ -59,7 +59,7 @@ without touching the engine.
 | `EdgeSampler` | 1 | Reads at the clock-edge callback. Correct for clocks driven from cocotb |
 | `TraceSampler` | 1 (tests), 3 (users) | Replays traces / FST / VCD; engine unit tests and offline checking |
 | `PreponedSampler` | 4 | Correct sampling for clocks generated or gated inside the HDL. Built as a sampling mode of the clock loop (`sampling="preponed"`, §6), not as a class |
-| `ProbeSampler` | 4 | Optional generated HDL wrapper: HDL-side sampling, one packed read, batching |
+| `ProbeSampler` | 4 | Optional generated HDL wrapper: HDL-side sampling, one packed read, batching. Built as `Probe` (`_probe.py`: generator) and `_ProbeDomain` (`_api.py`) |
 
 **Clocking event** is an object, not a signal: signal + edge
 (`posedge` / `negedge` / `edge`) + optional `iff` condition. All assertions on
@@ -428,10 +428,10 @@ assertion per cycle.
    `nexttime`, `accept_on` / `reject_on`, `cover`, `expect`, assertion control,
    statistics, vacuity warnings; idle sleep.
 3. **Speed:** optional compiled kernel, offline `TraceSampler`.
-4. **Clocking extensions:** `PreponedSampler` (done), multi-clock sequences
-   (done), `.triggered` / `.ended` (done), `ProbeSampler`: in progress, see
-   `phase4-results.md`. The library of ready-made checkers is deferred to a
-   later phase.
+4. **Clocking extensions:** `PreponedSampler`, multi-clock sequences,
+   `.triggered` / `.ended`, `ProbeSampler`: done, see `phase4-results.md`.
+5. **Later:** library of ready-made checkers (moved out of phase 4), CI and
+   wheels (§12).
 
 ## Appendix A — API sketch (not implemented)
 
