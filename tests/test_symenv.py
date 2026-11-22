@@ -37,7 +37,8 @@ class LGen:
         if k == 2:
             return f"{r.choice(['x', 'y'])} == {r.choice(['v', 'w'])}"
         if k == 3:
-            return f"{self.bit()} && {r.choice(['v', 'w'])} != {r.choice(['x', 'y', "3'd0"])}"
+            rhs = r.choice(["x", "y", "3'd0"])         # (no nested quotes: Python 3.10)
+            return f"{self.bit()} && {r.choice(['v', 'w'])} != {rhs}"
         if k == 4:
             return f"v == w || {self.bit()}"
         return f"({r.choice(['x', 'y'])} > v) || {self.bit()}"
