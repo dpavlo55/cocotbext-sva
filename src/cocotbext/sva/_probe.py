@@ -125,6 +125,19 @@ class Probe:
         return path
 
     def hdl(self, language: str, bind: bool = True, interface: str = "names") -> str:
+        """The probe's source code, as `write` would write it.
+
+        Args:
+            language: "verilog" (SystemVerilog) or "vhdl" (VHDL-2008).
+            bind: SystemVerilog: end with a `bind` into the top-level module.
+            interface: VHDL: "names" (external names) or "ports".
+
+        Returns:
+            The HDL source text.
+
+        Raises:
+            SvaError: `language` or `interface` is not one of the values above.
+        """
         if interface not in ("names", "ports"):
             raise SvaError("interface must be 'names' or 'ports'")
         if language == "vhdl":

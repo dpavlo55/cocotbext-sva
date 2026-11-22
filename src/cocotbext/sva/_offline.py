@@ -209,6 +209,20 @@ def _value(s: str, width: int):
 
 @dataclass
 class OfflineFailure:
+    """One failure found by `TraceSampler.run`.
+
+    Attempts of one assertion that fail at the same clock edge are merged
+    into one report with `count` > 1.
+
+    Attributes:
+        assertion: name of the assertion.
+        time_ns: time of the clock edge where the attempts failed. For
+            `at_end`: the `until_ns` given to `run`, else the dump's last
+            clock tick.
+        start_times_ns: start times of the failing attempts, oldest first.
+        count: number of attempts merged into this report.
+        at_end: a strong obligation still pending at the end of the dump.
+    """
     assertion: str
     time_ns: float                 # time of the clock edge where the attempt failed (at_end:
                                    # until_ns if given, else the dump's last clock tick)
@@ -225,6 +239,15 @@ class OfflineFailure:
 
 @dataclass
 class OfflineResult:
+    """What `TraceSampler.run` found.
+
+    Attributes:
+        failures: the `OfflineFailure` reports.
+        stats: assertion name -> counters: `attempts`, `passes`, `vacuous`,
+            `failures` for assertions; `attempts` and `hits` for covers.
+        cycles: number of clock ticks checked.
+        warnings: messages about the dump or the assertions.
+    """
     failures: list = field(default_factory=list)       # [OfflineFailure]
     stats: dict = field(default_factory=dict)          # name -> counters
     cycles: int = 0
@@ -232,9 +255,12 @@ class OfflineResult:
 
     @property
     def ok(self) -> bool:
+        """True when no assertion failed."""
         return not self.failures
 
     def summary(self) -> str:
+        """A readable report: clock cycles checked, the counters of each
+        assertion and cover, and the failures."""
         lines = [f"{self.cycles} clock cycles checked, {len(self.failures)} failure report(s)"]
         for name, st in self.stats.items():
             if "hits" in st:
@@ -246,7 +272,11 @@ class OfflineResult:
         return "\n".join(lines)
 
     def check(self):
-        """Raise AssertionError listing the failures, if any."""
+        """Raise `AssertionError` listing the failures, if there are any.
+
+        Raises:
+            AssertionError: an assertion failed.
+        """
         if self.failures:
             raise AssertionError("assertion failures in the dump:\n" + "\n".join(map(str, self.failures)))
 
@@ -294,14 +324,27 @@ class TraceSampler:
         ts.assert_property("req |=> @(posedge clk_b) ##[1:4] ack_b")   # multi-clock
         result = ts.run()          # result.ok, result.failures, result.summary()
 
-    Names in properties are resolved under `scope` (dot-separated, as in the
-    dump; case-insensitive fallback). `clock` is the default clock; a
-    property may name its own clocks (`@(negedge clk) ...`, `@(posedge c iff
-    en)`), several of them too (multi-clock properties: as online, one tick
-    per time step in which one of its clocks ticks). Immediate assertions,
-    local-variable-free and local-variable properties, sampled-value
-    functions and $isunknown (x/z in the dump) are supported; real-valued
-    signals are not.
+    Signals are sampled with the value they had just before each clock edge
+    (exact SVA sampling). A property may name its own clocks (`@(negedge
+    clk) ...`, `@(posedge c iff en)`), several of them too (multi-clock
+    properties: as online, one tick per time step in which one of its
+    clocks ticks). Local variables, sampled-value functions and `$isunknown`
+    (x/z in the dump) are supported; real-valued signals are not.
+
+    Args:
+        path: the VCD or FST file. Reading FST needs the compiled kernel
+            (`pip install cocotbext-sva[fast]`).
+        clock: default clock: "posedge clk", "negedge clk", "edge clk" or
+            just "clk" (rising edge), the name relative to `scope`.
+        scope: dot-separated instance path in the dump under which names
+            are looked up ("tb.dut"); case-insensitive if there is no exact
+            match.
+        disable_iff: default `disable iff` condition of the assertions (not
+            of the covers), unless a property has its own.
+        params: name -> constant usable in the properties.
+
+    Raises:
+        SvaError: `clock` is not in one of the forms above.
     """
 
     def __init__(self, path, clock: str, *, scope: str = "", disable_iff: str | None = None,
@@ -332,12 +375,35 @@ class TraceSampler:
         self.kinds[name] = kind
 
     def assert_property(self, prop, name: str | None = None):
+        """Add a concurrent assertion, checked by `run`.
+
+        Args:
+            prop: the property, in SVA. It may start with its own clocking
+                event and `disable iff (...)`.
+            name: name in the results; by default `assert<n>`.
+
+        Raises:
+            SvaSyntaxError: `prop` is not valid SVA (raised here).
+            SvaError: `name` is already used.
+        """
         self._add("assert", prop, name)
 
     def assume_property(self, prop, name: str | None = None):
+        """Add an assumption, checked like an assertion by `run`.
+
+        Args:
+            prop: the property, in SVA.
+            name: name in the results; by default `assume<n>`.
+        """
         self._add("assume", prop, name)
 
     def cover_property(self, prop, name: str | None = None):
+        """Add a cover, counted by `run`. The default `disable_iff` does not apply to covers.
+
+        Args:
+            prop: the sequence or property, in SVA.
+            name: name in the results; by default `cover<n>`.
+        """
         self._add("cover", prop, name)
 
     # -- evaluation ---------------------------------------------------------
@@ -345,8 +411,19 @@ class TraceSampler:
         return f"{self.scope}.{name}" if self.scope else name
 
     def run(self, until_ns: float | None = None) -> OfflineResult:
-        """Check the dump; with until_ns, only its time steps up to that time
-        (e.g. the end of the test, when the simulator dumped beyond it)."""
+        """Read the dump and check every assertion added so far.
+
+        Args:
+            until_ns: check only the time steps up to this time, e.g. the
+                end of the test when the simulator dumped beyond it. Strong
+                obligations still pending then fail at this time.
+
+        Returns:
+            The `OfflineResult`; `result.check()` raises if anything failed.
+
+        Raises:
+            SvaNameError: a name in a property is not in the dump.
+        """
         dump = open_dump(self.path)
         try:
             return self._run(dump, until_ns)
