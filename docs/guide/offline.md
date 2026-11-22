@@ -79,6 +79,11 @@ Dumps written by nvc, GHDL, Icarus and Verilator (VCD and FST) and by
 commercial simulators (VCD) give the same results as checking online.
 Vectors that a simulator dumps one bit per variable are put back together.
 
+VHDL simulators dump `std_logic`'s nine values. They are read as cocotb reads
+them during the simulation: `L` and `H` (weak 0 and 1) as 0 and 1; `U`
+(uninitialized), `W` (weak unknown) and `-` (don't care) as unknown, like `X`
+and `Z`: 0 in expressions, and seen by `$isunknown`.
+
 ## The end of the dump
 
 Simulators do not all stop the dump where the test stopped:

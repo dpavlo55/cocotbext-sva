@@ -126,7 +126,8 @@ class VcdReader(_Dump):
     def steps(self, wanted: set):
         """Yield (time, [(id code, value string), ...]) per time step, only
         for the wanted id codes. Value strings are "0", "1", "x", "z" or a
-        binary vector."""
+        binary vector, lowercase; VHDL simulators also write std_logic's
+        u, w, l, h and - (see _value)."""
         time, changes = 0, []
         toks = self._tokens
         for tok in toks:
@@ -136,7 +137,7 @@ class VcdReader(_Dump):
                     yield time, changes
                     changes = []
                 time = int(tok[1:])
-            elif c in "01xzXZ":
+            elif c in _SCALAR_STARTS:
                 code = tok[1:]
                 if code in wanted:
                     changes.append((code, c.lower()))
@@ -196,8 +197,15 @@ def open_dump(path):
     return VcdReader(path) if head.startswith(b"$") else FstReader(path)
 
 
+# VHDL simulators dump std_logic's nine values: weak 0 / 1 (L, H) read as 0 / 1,
+# uninitialized, weak unknown and don't care (U, W, -) as unknown, like X.
+_STD_LOGIC = str.maketrans("uwlh-", "xx01x")
+_SCALAR_STARTS = "01xzuwlh-XZUWLH"
+
+
 def _value(s: str, width: int):
-    """VCD value string -> (value, X mask)."""
+    """VCD or FST value string (lowercase) -> (value, X mask)."""
+    s = s.translate(_STD_LOGIC)
     if len(s) < width:                 # left-extend: x/z with itself, 0/1 with 0
         s = (s[0] if s[0] in "xz" else "0") * (width - len(s)) + s
     if "x" not in s and "z" not in s:

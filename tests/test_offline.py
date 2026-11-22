@@ -374,3 +374,30 @@ def test_property_with_arguments_offline(tmp_path):
         ts.assert_property(HANDSHAKE)
     with pytest.raises(SvaError, match="names or expressions"):
         ts.assert_property(HANDSHAKE(x=object(), y="gnt"))
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_std_logic_values_in_dump(tmp_path, fmt):
+    """VHDL simulators dump std_logic's U, W, L, H, -: L / H read as 0 / 1,
+    U, W, - as unknown (like X), on single bits and in vectors."""
+    path = tmp_path / "w.vcd"
+    path.write_text("\n".join([
+        "$timescale 1ns $end", "$scope module tb $end",
+        "$var logic 1 ! clk $end", "$var logic 1 \" a $end", "$var logic 4 # v [3:0] $end",
+        "$upscope $end", "$enddefinitions $end",
+        "#0", "$dumpvars", "0!", "U\"", "bUUUU #", "$end",
+        "#5", "1!",                       # edge 0: a=U, v=UUUU
+        "#8", "H\"", "bLHLH #",           # edge 1: a=H (1), v=0101
+        "#10", "0!", "#15", "1!",
+        "#18", "L\"", "bH-WL #",          # edge 2: a=L (0), v=1xx0
+        "#20", "0!", "#25", "1!", "#30", "0!", ""]))
+    ts = TraceSampler(as_format(path, fmt), clock="posedge clk", scope="tb")
+    ts.assert_property("!$isunknown(a)", name="a_known")        # fails at edge 0 only
+    ts.assert_property("!$isunknown(v)", name="v_known")        # fails at edges 0 and 2
+    ts.assert_property("$isunknown(v) || v == 5", name="v_5")   # edge 1: v == 0101
+    ts.assert_property("$isunknown(a) || a", name="a_high")        # a=L (0) at edge 2
+    res = ts.run()
+    by_name = {}
+    for f in res.failures:
+        by_name.setdefault(f.assertion, []).append(f.time_ns)
+    assert by_name == {"a_known": [5], "v_known": [5, 25], "a_high": [25]}
