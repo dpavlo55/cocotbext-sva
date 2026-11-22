@@ -65,10 +65,29 @@ without touching the engine.
 (`posedge` / `negedge` / `edge`) + optional `iff` condition. All assertions on
 the same clocking event share one sampling loop.
 
-**Multi-clock readiness:** every IR node carries its clocking event from day
-one, even though v1 accepts only one clock per property. Multi-clock sequences
-(`@(posedge a) x ##1 @(posedge b) y`) and `$past(..., @(clk))` are then a later
-extension of the compiler, not a rewrite.
+**Multi-clock properties (phase 4).** A clocking event inside a property is
+a `Clocked` node of the syntax tree. `_multiclock.py` rewrites such a
+property into a single-clock one over the *union* of its clocks' ticks (one
+tick per time step in which at least one of them ticks), with a boolean
+`t_c` per clock, following the clock rewriting of IEEE 1800 Annex F:
+
+| Under clock c | Over the union ticks |
+|---|---|
+| boolean `b` | `(!t_c)[*0:$] ##1 (t_c && b)` |
+| `R1 ##1 R2`, `R1 ##0 R2`, `[*n]`, `and`, `or`, `intersect`, `first_match` | the same operator on the rewritten operands |
+| `R1 ##n R2`, same clock | `R1 ##1 (one tick of c)[*n-1] ##1 R2` |
+| `R |-> P`, `R |=> P`, `#-#`, `#=#` | the same operator; `|=>` moves to the next union tick and P waits there for a tick of its clock |
+| `nexttime`, `always`, `eventually`, `until` and their `s_` forms | the same template, counting only the ticks where `t_c` is true (`tick` guard of the templates in `_prop.py`) |
+| any other operator not at a tick of its leading clock | `PAlign`: unstarted until that tick, like the consequent of `|=>` before its first tick |
+| `$past`, `$rose`, ... | gated by `t_c` |
+
+The engine is unchanged apart from two things: attempts start only at ticks
+of the leading clock (`GatedStep`), and the temporal templates take the tick
+guard. In simulation the assertions of one set of clocks share a
+`_MultiDomain`: preponed sampling, edge callbacks that only note which clocks
+ticked, and one evaluation per time step in the read-only phase (read-write
+phase on GHDL, where waiting for the read-only phase disturbs the simulation).
+The trace runner takes rows with one 1-bit column per clock.
 
 ## 4. Front end
 
@@ -289,8 +308,7 @@ pass/fail/vacuous action control.
 Named / parameterized sequences and properties; `let` as a macro.
 
 **Deferred:** `checker` blocks (use Python classes), `restrict`, global-clock
-functions (`$past_gclk` …), recursive properties, multi-clock sequences
-(phase 4).
+functions (`$past_gclk` …), recursive properties.
 
 ## 9. Semantic decisions (settled in phases 1 and 2)
 
@@ -405,8 +423,8 @@ assertion per cycle.
    `nexttime`, `accept_on` / `reject_on`, `cover`, `expect`, assertion control,
    statistics, vacuity warnings; idle sleep.
 3. **Speed:** optional compiled kernel, offline `TraceSampler`.
-4. **Clocking extensions:** `PreponedSampler` (done), multi-clock sequences,
-   `.triggered` / `.ended`, `ProbeSampler`: in progress, see
+4. **Clocking extensions:** `PreponedSampler` (done), multi-clock sequences
+   (done), `.triggered` / `.ended`, `ProbeSampler`: in progress, see
    `phase4-results.md`. The library of ready-made checkers is deferred to a
    later phase.
 
