@@ -45,6 +45,8 @@ def run(
     tag: str = "",
     timing: bool = False,
     public: bool = True,
+    extra_build_args: list | None = None,
+    extra_test_args: list | None = None,
 ) -> Path:
     """Build and run one cocotb test module; exit non-zero if any test failed.
 
@@ -80,6 +82,10 @@ def run(
         build_args.append("--std=2008")
     if sim == "ghdl":
         build_args.append("--std=08")
+    if sim not in VHDL_ONLY | VERILOG_ONLY and lang == "vhdl":
+        from cocotb_tools.runner import VHDL
+        build_args.append(VHDL("-2008"))
+    build_args += list(extra_build_args or [])
 
     runner = get_runner(sim)
     build_dir = here / "sim_build" / f"{sim}_{lang}{('_' + tag) if tag else ''}"
@@ -93,7 +99,7 @@ def run(
         timescale=("1ns", "1ps"),
         **({"waves": True} if sim == "verilator" and dump else {}),   # build with trace support
     )
-    test_args = ["--std=08"] if sim == "ghdl" else []
+    test_args = (["--std=08"] if sim == "ghdl" else []) + list(extra_test_args or [])
     plusargs = []
     pre_cmd = None
     if dump:

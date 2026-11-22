@@ -13,11 +13,12 @@ from ._api import (AssertionHandle, Assertions, BoundProperty, Checker, Clocking
                    Property, Sequence, checked, edge, negedge, posedge)
 from ._errors import SvaError, SvaNameError, SvaSyntaxError, SvaUnsupportedError
 from ._offline import OfflineFailure, OfflineResult, TraceSampler
+from ._probe import Probe
 
 __all__ = [
     "Assertions", "AssertionHandle", "BoundProperty", "Checker", "ClockingEvent", "Failure",
     "Property", "Sequence", "checked", "edge", "negedge", "posedge",
     "SvaError", "SvaNameError", "SvaSyntaxError", "SvaUnsupportedError",
-    "TraceSampler", "OfflineResult", "OfflineFailure",
+    "TraceSampler", "OfflineResult", "OfflineFailure", "Probe",
 ]
 __version__ = "0.1.0.dev0"

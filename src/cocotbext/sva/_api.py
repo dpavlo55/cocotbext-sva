@@ -17,10 +17,10 @@ from cocotb.triggers import (Event, FallingEdge, First, NextTimeStep, ReadOnly, 
                              RisingEdge, ValueChange)
 
 from . import _ast as A
-from ._access import signal_info, x_reader
+from ._access import _TO_BIN, _TO_XMASK, signal_info, x_reader
 from ._compile import Compiler, NamedDef, gen_value_fn, substitute
 from ._engine import GatedStep, Monitor, build_runner, make_kernel
-from ._errors import SvaError, SvaNameError
+from ._errors import SvaError, SvaNameError, SvaUnsupportedError
 from ._expr import ConstRef, ExprCompiler, Resolver, SignalRef
 from ._multiclock import Rewriter, has_clocks, strip_clocks, uses_clocks
 from ._parser import parse_assertion, parse_expression, parse_sequence_or_property
@@ -822,6 +822,204 @@ class _MultiDomain(_Domain):
             self._flush()
 
 
+class ProbeClock:
+    """Clocking event of a generated HDL probe (Probe.attach)."""
+
+    def __init__(self, probe, dut, instance=None, iff: str | None = None):
+        self.probe = probe
+        self.dut = dut
+        self.instance = instance
+        self.iff_text = iff
+
+    def handle(self):
+        """The probe instance in the running simulation."""
+        if self.instance is not None:
+            return self.instance
+        name = self.probe.module
+        inst = _child(self.dut, name)
+        if inst is None:
+            # not bound into the design: a top-level module of its own
+            try:
+                from cocotb import simulator
+                from cocotb.handle import _make_sim_object
+                root = simulator.get_root_handle(name)
+                inst = _make_sim_object(root) if root is not None else None
+            except Exception:
+                inst = None
+        if inst is None:
+            raise SvaError(f"probe instance '{name}' not found: compile the generated file with the "
+                           f"design (and instantiate it, in VHDL), or pass instance= to attach()")
+        return inst
+
+    def __repr__(self):
+        return f"@(probe {self.probe.name})"
+
+
+class _ProbeDomain(_Domain):
+    """Assertions evaluated on the samples of a generated HDL probe (_probe.py).
+
+    The probe stores the signals at each tick of its clock, with the time,
+    in a buffer of `depth` samples and toggles `flush` when the buffer is
+    full. This domain wakes on `flush`, reads the buffer (one vector) and
+    evaluates the new samples in order; results are also brought up to date
+    when they are read (stats, finalize). Failure times are the times of the
+    samples. No idle sleep (there is at most one wake-up per `depth` ticks)."""
+
+    def __init__(self, key, pc: ProbeClock):
+        inst = pc.handle()
+        self.probe = pc.probe
+        super().__init__(key, inst.sva_flush, "edge", f"probe {pc.probe.name}", "edge")
+        self.idle_sleep = False
+        self._get_data = inst.sva_data._handle.get_signal_val_binstr
+        self._get_stamp = inst.sva_stamp._handle.get_signal_val_binstr
+        self._get_count = inst.sva_count._handle.get_signal_val_binstr
+        self._count_handle = inst.sva_count
+        self._done = self._read_count()   # samples taken before this point are not evaluated
+        self._cur = 0                    # sample being evaluated, and its X mask
+        self._curx = 0
+        self._idx = 0                    # its place in the buffer
+        self._stamp_val = None           # the buffer's time stamps (read when first needed)
+        self._t = (-1, 0)                # (tick, its time in simulator steps)
+        self._unit = None                # simulator steps per unit of the probe's time stamps
+        self._cal_cb = None
+        self.overruns = 0
+
+    def _read_count(self) -> int:
+        try:
+            return int(self._get_count(), 2)
+        except ValueError:
+            return 0
+
+    # names of the probe's signals
+    def probe_ref(self, name):
+        s = self.probe.signals.get(name)
+        if s is None:
+            low = {k.lower(): v for k, v in self.probe.signals.items()}
+            s = low.get(name.lower())
+            if s is None:
+                return None
+        off, m = s.offset, (1 << s.width) - 1
+        slot = self.value_slot(("probe", s.name), lambda: (self._cur >> off) & m, s.name)
+        self._slot_sig = getattr(self, "_slot_sig", {})
+        self._slot_sig[slot] = s
+        return SignalRef(slot, s.width, s.signed, label=s.name)
+
+    def probe_xslot(self, slot) -> int:
+        k = self.xslot_of.get(("probe", slot))
+        if k is None:
+            s = self._slot_sig[slot]
+            off, m = s.offset, (1 << s.width) - 1
+            k = self.xslot_of[("probe", slot)] = len(self.RX)
+            self.RX.append(lambda: (self._curx >> off) & m)
+            self.xhandles.append(None)
+            self.cx.append(None)
+        return k
+
+    def now(self):
+        """Time of the sample being evaluated, in simulator steps."""
+        tick, t = self._t
+        if tick != self.tickno:
+            if self._stamp_val is None:
+                self._stamp_val = self._stamps()
+            t = ((self._stamp_val >> (self._idx * 64)) & 0xFFFFFFFFFFFFFFFF) * (self._unit or 0)
+            self._t = (self.tickno, t)
+        return t
+
+    def start(self):
+        if self.task is None or self.task.done():
+            self.stopped = False
+            self.error = None
+            self._err = Event()
+            self.task = cocotb.start_soon(self._relay())
+            self._arm()
+            self._cal_cb = ValueChange(self._count_handle)._register(self._calibrate)
+
+    def _stop(self):
+        if self._cal_cb is not None:
+            self._cal_cb.cancel()
+            self._cal_cb = None
+        super()._stop()
+
+    def _calibrate(self):
+        """First sample: the unit of the probe's time stamps, from the stamp
+        of the sample just taken (in this time step) and the current time."""
+        self._cal_cb = None
+        if self.stopped or self._unit is not None:
+            return
+        self._set_unit(self._read_count(), self._stamps())
+        if self._unit is None:           # a tick at time 0: try the next one
+            self._cal_cb = ValueChange(self._count_handle)._register(self._calibrate)
+
+    def _stamps(self) -> int:
+        s = self._get_stamp()
+        try:
+            return int(s, 2)
+        except ValueError:
+            return int(s.translate(_TO_BIN) or "0", 2)
+
+    def _set_unit(self, count, stamps):
+        last = (stamps >> (((count - 1) % self.probe.depth) * 64)) & 0xFFFFFFFFFFFFFFFF
+        if last:
+            now = _sim_steps()
+            self._unit = now // last if now % last == 0 else now / last
+
+    def _on_clock(self):
+        if self.stopped:
+            self._cb = None
+            return
+        self._arm()
+        try:
+            self._drain(True)
+        except BaseException as e:     # noqa: B036 - relayed to the test
+            self.error = e
+            self._stop()
+            self._err.set()
+
+    def wake(self, changed: bool = False):
+        if not self.stopped:
+            self._drain(False)
+
+    def _drain(self, flushed: bool):
+        """Evaluate the samples taken since the last call. flushed: called
+        because the buffer is full (its newest sample was taken in this time
+        step)."""
+        count = self._read_count()
+        n = (count - self._done) & 0xFFFFFFFF
+        if not n:
+            return
+        depth, w = self.probe.depth, self.probe.width
+        if n > depth:
+            self.overruns += 1
+            _log.error("probe %s: %d samples were overwritten before they were read",
+                       self.probe.name, n - depth)
+            self._done = (count - depth) & 0xFFFFFFFF
+            n = depth
+        s = self._get_data()
+        try:
+            data, xmask = int(s, 2), 0
+        except ValueError:
+            data, xmask = int(s.translate(_TO_BIN), 2), int(s.translate(_TO_XMASK), 2)
+        # the time stamps are read when a time is first asked for (now())
+        self._stamp_val = None
+        if self._unit is None and flushed:
+            self._stamp_val = self._stamps()
+            self._set_unit(count, self._stamp_val)
+        m = (1 << w) - 1
+        c, cx, H, R, RX = self.c, self.cx, self.H, self.R, self.RX
+        blank, blankx = [None] * len(c), [None] * len(cx)
+        iff, evaluate = self.iff_fn, self._evaluate
+        for _ in range(n):
+            idx = self._idx = self._done % depth
+            self._done = (self._done + 1) & 0xFFFFFFFF
+            self._cur = (data >> (idx * w)) & m
+            self._curx = (xmask >> (idx * w)) & m
+            c[:] = blank
+            cx[:] = blankx
+            self.tickno += 1
+            if iff is None or iff(c, R, cx, RX, H):
+                evaluate()
+
+
 _domains: dict = {}
 IDLE_SLEEP = os.environ.get("COCOTBEXT_SVA_IDLE_SLEEP", "1") not in ("0", "", "false", "no")
 
@@ -853,7 +1051,11 @@ class _Binder(Resolver):
         if name.startswith(_TICK):
             slot = self.domain.tick_slots[int(name[len(_TICK):])]
             return SignalRef(slot, 1, False, label=self.domain.labels[slot])
-        if name in self.signals:
+        probe = isinstance(self.domain, _ProbeDomain)
+        if probe and name in self.values:
+            raise SvaError(f"'{name}': values= cannot be used with a probe (the samples are taken "
+                           f"in the simulator)")
+        if name in self.signals and not probe:
             return self._signal_ref(self.signals[name], name)
         if name in self.values:
             fn = self.values[name]
@@ -867,6 +1069,8 @@ class _Binder(Resolver):
             if name in consts:
                 v = consts[name]
                 return ConstRef(int(v))
+        if probe:
+            return self.domain.probe_ref(name)
         handle = g._resolve_path(path)
         if handle is None:
             return None
@@ -900,6 +1104,8 @@ class _Binder(Resolver):
         raise SvaError("'.triggered' is only available in properties")
 
     def x_slot(self, ref):
+        if isinstance(self.domain, _ProbeDomain):
+            return self.domain.probe_xslot(ref.slot)
         handle = self.group._handles_by_slot.get((id(self.domain), ref.slot))
         if handle is None:
             raise SvaError(f"X detection is not available for '{ref.label}'")
@@ -1211,7 +1417,11 @@ class Assertions:
 
         default = None
         if spec.clock is not None or clock is not None or self._default_clock() is not None:
-            default = clock_id(self._clock_for(spec.clock, clock, overrides))
+            ev = self._clock_for(spec.clock, clock, overrides)
+            if ev[0] == "probe":
+                raise SvaUnsupportedError("clocking events in a property are not supported with a "
+                                          "probe (one clock per probe)")
+            default = clock_id(ev)
 
         def no_tick(cid):
             raise SvaError("no clock: part of the property is not under a clocking event "
@@ -1330,6 +1540,9 @@ class Assertions:
             ev = parse_assertion(text + " 1").clock
             return ("ast", self._clock_signal(ev.signal, overrides), ev.edge or "edge", ev.iff,
                     self._default_sampling())
+        if isinstance(clk, ProbeClock):
+            iff = parse_expression(clk.iff_text) if clk.iff_text else None
+            return ("probe", clk, "edge", iff, "probe")
         if isinstance(clk, ClockingEvent):
             iff = parse_expression(clk.iff_text) if clk.iff_text else None
             return ("ast", clk.signal, clk.edge, iff, clk.sampling or self._default_sampling())
@@ -1363,12 +1576,18 @@ class Assertions:
         return h
 
     def _domain_for(self, clock_ev, overrides):
-        _, sig, edge_kind, iff, sampling = clock_ev
+        how, sig, edge_kind, iff, sampling = clock_ev
         iff_text = None
         if iff is not None:
             iff_text = _node_text(iff)
-        label = f"{edge_kind} {getattr(sig, '_path', sig)}"
-        d = _get_domain(sig, edge_kind, iff_text, id(self), label, sampling)
+        if how == "probe":
+            key = ("probe", id(sig.probe), id(sig.dut), iff_text)
+            d = _domains.get(key)
+            if d is None or (d.task is not None and d.task.done()):
+                d = _domains[key] = _ProbeDomain(key, sig)
+        else:
+            label = f"{edge_kind} {getattr(sig, '_path', sig)}"
+            d = _get_domain(sig, edge_kind, iff_text, id(self), label, sampling)
         if iff is not None and d.iff_fn is None:
             binder = _Binder(self, d, overrides, {})
             ec = ExprCompiler(binder, iff_text)
@@ -1485,7 +1704,8 @@ class Assertions:
         if msg and "{" in msg:
             msg = self._format_message(msg, h)
         f = Failure(h.name, h.prog.text, t, start_ns, count, h.severity, msg, values, at_end)
-        self._record(f, h)
+        # (a probe with a buffer reports after the fact: say when it failed)
+        self._record(f, h, late=isinstance(h.domain, _ProbeDomain) and steps_now != _sim_steps())
 
     def _format_message(self, msg, h):
         import re
@@ -1498,7 +1718,7 @@ class Assertions:
                 return m.group(0)
         return re.sub(r"\{([A-Za-z_][\w.]*)\}", repl, msg)
 
-    def _record(self, f: Failure, h):
+    def _record(self, f: Failure, h, late: bool = False):
         self.failures.append(f)
         log = _log.getChild(f.name)
         level = {"info": logging.INFO, "warning": logging.WARNING, "error": logging.ERROR,
@@ -1513,7 +1733,8 @@ class Assertions:
             starts = ", ".join(f"{s:g} ns" for s in f.start_times[:4])
             more = "" if len(f.start_times) <= 4 and f.count <= len(f.start_times) else ", ..."
             extra = f" ({f.count} attempts)" if f.count > 1 else ""
-            lines.append(f"FAILED{extra}  attempt started {starts}{more}")
+            when = f" at {f.time:g} ns" if late else ""
+            lines.append(f"FAILED{when}{extra}  attempt started {starts}{more}")
         lines.append(f"    {f.text}")
         if f.message:
             lines.append(f"    {f.message}")
