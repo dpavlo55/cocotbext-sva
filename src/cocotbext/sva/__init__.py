@@ -21,4 +21,8 @@ __all__ = [
     "SvaError", "SvaNameError", "SvaSyntaxError", "SvaUnsupportedError",
     "TraceSampler", "OfflineResult", "OfflineFailure", "Probe",
 ]
-__version__ = "0.1.0.dev0"
+try:  # the version of the installed distribution: set in pyproject.toml only
+    from importlib.metadata import version as _version
+    __version__ = _version("cocotbext-sva")
+except Exception:  # not installed (e.g. src/ on sys.path)
+    __version__ = "0+unknown"
