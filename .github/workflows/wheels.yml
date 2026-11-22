@@ -1,7 +1,7 @@
 # Distributions: the pure-Python package (wheel and sdist) and abi3 wheels of
 # the compiled kernel (one per platform, for every Python >= 3.10), uploaded
 # as workflow artifacts. Runs on version tags, on demand, and when the kernel
-# or the packaging changes. Publishing to PyPI is not set up here.
+# or the packaging changes. A v* tag also uploads them to PyPI (job publish).
 name: Wheels
 
 on:
@@ -13,6 +13,11 @@ on:
       - "pyproject.toml"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
+    inputs:
+      testpypi:
+        description: "Upload the built distributions to TestPyPI"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -143,3 +148,40 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install --no-index --find-links wheels cocotbext-sva-kernel
           COCOTBEXT_SVA_KERNEL=native python -m pytest -q tests/test_kernel.py tests/test_offline.py
+
+  # Upload to PyPI (on a v* tag) or TestPyPI (run by hand with testpypi=true)
+  # by trusted publishing: no token is stored; PyPI trusts this workflow,
+  # file and environment for the two projects (see docs/release.md).
+  publish:
+    name: publish
+    needs: [package, kernel-sdist, kernel-test]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.testpypi)
+    runs-on: ubuntu-24.04
+    environment:
+      name: ${{ startsWith(github.ref, 'refs/tags/v') && 'pypi' || 'testpypi' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Check versions against the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for f in pyproject.toml kernel/pyproject.toml; do
+            v=$(python3 -c "import tomllib,sys; print(tomllib.load(open(sys.argv[1],'rb'))['project']['version'])" "$f")
+            [ "$v" = "$tag" ] || { echo "$f has version $v, tag is $tag"; exit 1; }
+          done
+          ls -l dist
+      - name: Upload to PyPI
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Upload to TestPyPI
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
