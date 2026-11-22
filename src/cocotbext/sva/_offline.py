@@ -210,7 +210,8 @@ def _value(s: str, width: int):
 @dataclass
 class OfflineFailure:
     assertion: str
-    time_ns: float                 # time of the clock edge where the attempt failed
+    time_ns: float                 # time of the clock edge where the attempt failed (at_end:
+                                   # until_ns if given, else the dump's last clock tick)
     start_times_ns: list           # start times of the attempts (oldest first)
     count: int
     at_end: bool = False           # pending strong obligation at the end of the dump
@@ -472,10 +473,11 @@ class TraceSampler:
                   None if g.ticks is None else list(zip(g.clocks, g.ticks)))
                  for g in groups.values()]
         cycles = [0]
-        last = None if until_ns is None else until_ns / vcd.ns_per_unit + 0.5   # (dump time units)
+        # [last time step to check (dump units) or None, time of the last tick]
+        last = [None if until_ns is None else until_ns / vcd.ns_per_unit + 0.5, 0]
 
         def on_step(time, changes):
-            if last is not None and time > last:
+            if last[0] is not None and time > last[0]:
                 return
             edges = None
             for code, v in changes:
@@ -521,6 +523,7 @@ class TraceSampler:
                     stepped = True
                 if stepped:
                     cycles[0] += 1
+                    last[1] = time
             for code, v in changes:
                 for name, width, bit in by_code.get(code, ()):
                     if bit is None:
@@ -535,6 +538,8 @@ class TraceSampler:
                         cur[(name, "x")] = xm
 
         vcd.stream(wanted, on_step)
+        # failures at the end: at until_ns, else at the last tick of the dump
+        self._end_ns = until_ns if until_ns is not None else last[1] * vcd.ns_per_unit
         stats = {}
         for g in groups.values():
             stats.update(g.run.finish().stats)
@@ -552,4 +557,5 @@ class TraceSampler:
         def at(tick):
             return times[min(tick, len(times) - 1)] * unit if times else 0.0
         self.result.failures.append(OfflineFailure(
-            name, at(tickno), [at(s[0]) for s in sorted(starts)], count, at_end))
+            name, self._end_ns if at_end else at(tickno), [at(s[0]) for s in sorted(starts)], count,
+            at_end))

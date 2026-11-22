@@ -323,8 +323,12 @@ def test_property_clocks_offline(tmp_path):
     ts.assert_property("a |=> @(posedge clk2) b", name="mc")         # a at 1 -> clk2 at 4: b = 0
     ts.assert_property("@(posedge clk) a |=> @(posedge clk) b", name="same")   # one clock, holds
     ts.cover_property("@(posedge clk2) a ##1 @(posedge clk) b", name="cov")
+    ts.assert_property("@(posedge clk2) a |-> s_eventually (b && !b)", name="end")   # pending
     res = ts.run()
-    fails = sorted((f.assertion, f.time_ns, tuple(f.start_times_ns)) for f in res.failures)
+    # failures at the end of the dump: at its last tick (clk at 75 ns)
+    assert [(f.time_ns, f.start_times_ns, f.count) for f in res.failures if f.at_end] ==         [(75.0, [15.0, 45.0], 2)]                   # (the two attempts merged)
+    fails = sorted((f.assertion, f.time_ns, tuple(f.start_times_ns)) for f in res.failures
+                   if not f.at_end)
     assert fails == [("mc", 45.0, (15.0,)), ("neg2", 18.0, (18.0,)), ("neg2", 48.0, (48.0,)),
                      ("on2", 65.0, (65.0,)), ("on2_en", 65.0, (65.0,))], fails
     assert res.stats["on2"]["attempts"] == 3 and res.stats["on2_en"]["attempts"] == 2
@@ -332,8 +336,8 @@ def test_property_clocks_offline(tmp_path):
     assert res.stats["mc"]["attempts"] == 8 and res.stats["mc"]["vacuous"] == 5
     assert res.stats["cov"] == {"attempts": 3, "hits": 2}
     assert res.cycles == 8 + 3              # clk at every step, plus the falling edges of clk2
-    early = ts.run(until_ns=40)             # time steps up to 40 ns only
-    assert [(f.assertion, f.time_ns) for f in early.failures] == [("neg2", 18.0)]
+    early = ts.run(until_ns=40)             # time steps up to 40 ns only; the end is at 40 ns
+    assert [(f.assertion, f.time_ns, f.at_end) for f in early.failures] ==         [("neg2", 18.0, False), ("end", 40.0, True)]
     assert early.cycles == 4 + 1 and early.stats["mc"]["attempts"] == 4
     with pytest.raises(SvaError, match="clock 'nope' not found"):
         bad = TraceSampler(path, clock="posedge clk", scope="tb.dut")

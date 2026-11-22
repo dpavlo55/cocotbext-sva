@@ -67,12 +67,6 @@ def check(fmt, toplevel, module, timing):
                            for f in res.failures),
         "stats": res.stats,
     }
-    # (the time of a failure at the end of the test is not that of a tick)
-    for fails in (offline["failures"], online["failures"]):
-        for f in fails:
-            if f[4]:
-                f[1] = None
-        fails.sort(key=json.dumps)
     problems = []
     if offline["failures"] != online["failures"]:
         on = {json.dumps(x) for x in online["failures"]}

@@ -1683,7 +1683,8 @@ class Assertions:
 
     # -- reporting ------------------------------------------------------------
     def _report_failure(self, h: AssertionHandle, count, starts, at_end):
-        steps_now = h.domain.now()
+        # at the end of the test: the time the obligation is decided (now)
+        steps_now = _sim_steps() if at_end else h.domain.now()
         t = _now_ns(steps_now)
         start_ns = [_now_ns(s[1]) for s in sorted(starts)]
         values = {}
