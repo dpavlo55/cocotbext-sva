@@ -25,7 +25,10 @@
 
 ```{eval-rst}
 .. autoclass:: Property
-.. autoclass:: Sequence
+.. class:: Sequence
+
+   The same class as `Property`; use whichever name reads better.
+
 .. autoclass:: BoundProperty
 .. autoclass:: Checker
 ```

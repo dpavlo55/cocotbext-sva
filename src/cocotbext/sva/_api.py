@@ -49,14 +49,28 @@ RECHECK_TICKS = 16
 # --------------------------------------------------------------------------
 
 class ClockingEvent:
-    """A clock signal, an edge and an optional `iff` condition.
+    """A clock signal, an edge and an optional `iff` condition: the SVA
+    clocking event `@(posedge clk iff en)`.
 
-    `sampling` selects how values are sampled at a tick of this clock:
-    "edge" reads them when the clock edge is seen (exact for clocks driven
-    from cocotb), "preponed" takes them at the start of the time step (exact
-    for every clock, including clocks generated or derived inside the HDL, at
-    a higher cost per cycle), "auto" (the default) compares the two for a
-    while and keeps "edge" unless they differ.
+    Usually made with `posedge`, `negedge` or `edge`, and passed as the
+    `clock` of an `Assertions` group or of one assertion::
+
+        a = Assertions(dut, clock=posedge(dut.clk).iff("en"))
+
+    Args:
+        signal: handle of the clock signal.
+        edge: "posedge", "negedge" or "edge" (both edges).
+        iff: SVA expression; ticks where it is false are skipped.
+        sampling: how values are sampled at a tick of this clock. "edge"
+            reads them when the clock edge is seen: exact for clocks driven
+            from cocotb. "preponed" takes them at the start of the time step:
+            exact for every clock, including clocks generated or derived
+            inside the HDL, at a higher cost per cycle. "auto" compares the
+            two for a while and keeps "edge" unless they differ. `None` (the
+            default) uses the group's sampling, else "auto".
+
+    Raises:
+        ValueError: `edge` or `sampling` is not one of the values above.
     """
 
     def __init__(self, signal, edge: str = "posedge", iff: str | None = None,
@@ -71,7 +85,14 @@ class ClockingEvent:
         self.sampling = sampling
 
     def iff(self, condition: str) -> "ClockingEvent":
-        """Qualify the clock: ticks only count when `condition` is true (like `@(posedge clk iff en)`)."""
+        """The same clock, ticking only where `condition` is true.
+
+        Args:
+            condition: SVA expression, as in `@(posedge clk iff en)`.
+
+        Returns:
+            A new `ClockingEvent`; this one is unchanged.
+        """
         return ClockingEvent(self.signal, self.edge, condition, self.sampling)
 
     def __repr__(self):
@@ -81,14 +102,41 @@ class ClockingEvent:
 
 
 def posedge(signal, sampling: str | None = None) -> ClockingEvent:
+    """The rising edge of `signal`, SVA `@(posedge signal)`.
+
+    Args:
+        signal: handle of the clock signal, e.g. `dut.clk`.
+        sampling: "auto", "edge" or "preponed"; see `ClockingEvent`.
+
+    Returns:
+        A `ClockingEvent`; add a condition with `.iff("en")`.
+    """
     return ClockingEvent(signal, "posedge", sampling=sampling)
 
 
 def negedge(signal, sampling: str | None = None) -> ClockingEvent:
+    """The falling edge of `signal`, SVA `@(negedge signal)`.
+
+    Args:
+        signal: handle of the clock signal.
+        sampling: "auto", "edge" or "preponed"; see `ClockingEvent`.
+
+    Returns:
+        A `ClockingEvent`; add a condition with `.iff("en")`.
+    """
     return ClockingEvent(signal, "negedge", sampling=sampling)
 
 
 def edge(signal, sampling: str | None = None) -> ClockingEvent:
+    """Both edges of `signal`, SVA `@(signal)` or `@(edge signal)`.
+
+    Args:
+        signal: handle of the clock signal.
+        sampling: "auto", "edge" or "preponed"; see `ClockingEvent`.
+
+    Returns:
+        A `ClockingEvent`; add a condition with `.iff("en")`.
+    """
     return ClockingEvent(signal, "edge", sampling=sampling)
 
 
@@ -97,16 +145,27 @@ def edge(signal, sampling: str | None = None) -> ClockingEvent:
 # --------------------------------------------------------------------------
 
 class Property:
-    """A property (or sequence) with formal arguments, like an SV `property ... endproperty`.
+    """A property (or sequence) with formal arguments, like an SV
+    `property ... endproperty` declaration. `Sequence` is the same class.
 
-    Example::
+    Define it once, then call it with actual arguments and pass the result
+    to `Assertions.assert_property` or `Assertions.cover_property`::
 
         VALID_HELD = Property("valid && !ready |=> valid && $stable(data)",
                               args=("valid", "ready", "data"))
         a.assert_property(VALID_HELD(valid="in_valid", ready="in_ready", data=dut.in_data))
 
-    Actual arguments are names or expressions (strings) resolved in the
-    assertion's scope, or signal handles.
+    Calling it takes the arguments by position or by name; every argument
+    must be given. An actual argument is a name or an expression (a string)
+    resolved in the assertion's scope, or a signal handle.
+
+    Args:
+        text: the property or sequence, in SVA.
+        args: names of the formal arguments used in `text`.
+
+    Raises:
+        SvaSyntaxError: `text` is not valid SVA (raised here, not at use).
+        TypeError: when called with a missing, extra or unknown argument.
     """
 
     def __init__(self, text: str, args: tuple = ()):
@@ -130,11 +189,18 @@ class Property:
 
 @dataclass
 class BoundProperty:
+    """A `Property` with its actual arguments, made by calling the property.
+
+    Attributes:
+        prop: the `Property`.
+        bindings: formal argument name -> actual argument.
+    """
     prop: Property
     bindings: dict
 
     @property
     def text(self):
+        """The property's SVA text, with the formal argument names."""
         return self.prop.text
 
 
@@ -147,7 +213,24 @@ Sequence = Property
 
 @dataclass
 class Failure:
-    """One reported failure (several merged attempts are reported once with count > 1)."""
+    """One reported assertion failure, as passed to `on_fail` callbacks.
+
+    Attempts of one assertion that fail at the same tick are merged into one
+    `Failure` with `count` > 1.
+
+    Attributes:
+        name: full name of the assertion (group name prefix included).
+        text: the property or expression, as written.
+        time: simulation time of the failure, in ns.
+        start_times: start times of the failing attempts, in ns, oldest first.
+        count: number of attempts merged into this report.
+        severity: "info", "warning", "error" or "fatal".
+        message: the assertion's message, with `{signal}` references replaced
+            by their values.
+        values: signal name -> value sampled at the failing tick.
+        at_end: a strong obligation still pending at the end of the test.
+        immediate: the failure of an immediate assertion (`check`).
+    """
     name: str
     text: str
     time: float                  # simulation time of the failure, in ns
@@ -1134,7 +1217,15 @@ class _Binder(Resolver):
 # --------------------------------------------------------------------------
 
 class AssertionHandle:
-    """An assertion attached to a clocking domain (returned by assert_property & co.)."""
+    """A concurrent assertion, cover or assumption, returned by
+    `Assertions.assert_property`, `Assertions.cover_property` and
+    `Assertions.assume_property`.
+
+    Attributes:
+        name: full name of the assertion (group name prefix included).
+        kind: "assert", "assume", "cover" or "expect".
+        severity: severity of its failures.
+    """
 
     def __init__(self, group, name, prog, domain, severity, message, on_fail, on_pass,
                  initial: bool = False):
@@ -1161,6 +1252,13 @@ class AssertionHandle:
 
     @property
     def stats(self) -> dict:
+        """Counters so far.
+
+        For an assertion or assumption: `attempts`, `passes`, `vacuous`
+        (passed without checking anything, e.g. a false antecedent),
+        `failures`, `disabled` (ended by `disable iff`) and `pending_fail`.
+        For a cover: `attempts` and `hits`.
+        """
         self.domain.wake(True)      # apply ticks counted during idle sleep
         d = self.monitor.stats.as_dict()
         if self.kind == "cover":
@@ -1169,6 +1267,7 @@ class AssertionHandle:
 
     @property
     def enabled(self) -> bool:
+        """Whether new attempts start (see `Assertions.off` and `Assertions.on`)."""
         return self.monitor.enabled
 
     # sink protocol used by the engine
@@ -1191,21 +1290,49 @@ _test_groups: list = []        # groups created in the current @checked test
 
 
 class Assertions:
-    """A group of assertions on one design scope.
+    """A group of assertions on one design scope, with a default clock and
+    `disable iff`.
+
+    ::
+
+        a = Assertions(dut, clock=posedge(dut.clk), disable_iff="!rst_n", name="top")
+        a.assert_property("req |-> ##[1:3] ack", name="req_gets_ack")
+
+    Names in assertion text are resolved when the assertion is created, so a
+    typo raises `SvaNameError` at once, with suggestions.
+
+    Failures are logged when they happen and collected. They fail the test
+    only through `checked`, `async with Assertions(...)` (which finalizes at
+    the end of the block, raising if an assertion failed) or `finalize`.
 
     Args:
-        scope: hierarchy handle (usually `dut`) in which bare names are looked up.
-        clock: default clocking event: `posedge(dut.clk)`, a clock handle (posedge),
-            or a string such as "posedge clk" / "@(negedge clk iff en)".
-        disable_iff: default `disable iff` condition (SVA expression string).
-        name: prefix for assertion names in reports.
-        params: constants usable in assertions (`DEPTH`, ...).
+        scope: hierarchy handle, usually `dut`, in which names are looked
+            up (case-insensitively for VHDL). Dotted names reach below it:
+            `u_ctrl.count`.
+        clock: default clocking event of the group's assertions: a
+            `ClockingEvent` (`posedge(dut.clk)`), a clock handle (its rising
+            edge), a string such as "posedge clk" or "@(negedge clk iff en)",
+            or `Probe.attach(...)`. A string without an edge keyword means
+            both edges, as in SVA.
+        disable_iff: default `disable iff` condition, an SVA expression.
+            Covers are disabled by it too.
+        name: prefix of the assertion names in reports and in the patterns
+            of `off`, `on` and `kill`.
+        params: name -> constant usable in assertions (`count <= DEPTH`).
         enums: an `enum.IntEnum` class or a dict of enumeration literals
-            (`state == S_BUSY`); values are what cocotb reads for the signal.
-        signals: name -> handle aliases usable in every assertion of the group.
-        sampling: "auto" (default), "edge" or "preponed": how values are sampled
-            at a clock tick (see ClockingEvent). A clocking event's own
-            sampling= takes precedence.
+            (`state == S_BUSY`); the values are the integers cocotb reads
+            for the signal.
+        signals: name -> handle, aliases usable in every assertion of the
+            group.
+        lets: name -> SVA expression, as if defined with `let`.
+        parent: the group this one belongs to (used by `Checker`): defaults
+            are inherited from it, and failures and the summary go to it.
+        sampling: how values are sampled at a clock tick: "auto" (the
+            default), "edge" or "preponed"; see `ClockingEvent`. A clocking
+            event's own `sampling` takes precedence.
+
+    Raises:
+        ValueError: `sampling` is not one of the values above.
     """
 
     def __init__(self, scope=None, clock=None, disable_iff: str | None = None, name: str = "sva",
@@ -1277,11 +1404,41 @@ class Assertions:
         return f"{self.name}.{name}" if self.name else name
 
     def sequence(self, name: str, text: str, args: tuple = ()):
-        """Define a named sequence usable by name in later assertions (`burst4 ##1 idle`)."""
+        """Define a named sequence, like an SV `sequence` declaration.
+
+        Later assertions of the group can use it by name::
+
+            a.sequence("burst4", "(valid && ready)[*4]")
+            a.assert_property("burst4 |=> !valid")
+            a.assert_property("burst4.triggered |=> !valid")   # where a match ends
+
+        Args:
+            name: the name used in assertions.
+            text: the sequence (or property), in SVA.
+            args: names of formal arguments, given where it is used:
+                `pulse(req, 2)`.
+
+        Raises:
+            SvaSyntaxError: `text` is not valid SVA.
+        """
         self.named[name] = NamedDef(name, parse_sequence_or_property(text), tuple(args), text)
 
     def let(self, name: str, text: str):
-        """Define a named expression (macro), like SV `let`."""
+        """Define a named expression, like SV `let`.
+
+        The name is replaced by the expression wherever it appears in later
+        assertions of the group::
+
+            a.let("hs", "valid && ready")
+            a.assert_property("hs |=> !valid")
+
+        Args:
+            name: the name used in assertions.
+            text: the expression, in SVA.
+
+        Raises:
+            SvaSyntaxError: `text` is not valid SVA.
+        """
         self.lets[name] = parse_sequence_or_property(text)
 
     # -- concurrent assertions ----------------------------------------------
@@ -1290,18 +1447,65 @@ class Assertions:
                         severity: str = "error", message: str | None = None,
                         on_fail: Callable | None = None, on_pass: Callable | None = None,
                         initial: bool = False) -> AssertionHandle:
-        """Check a concurrent property on every clock tick (SV `assert property`).
+        """Check a concurrent property, SV `assert property`.
 
-        `values` maps names to Python callables sampled at the clock tick.
-        `message` may reference signals in braces: "count={u_ctrl.count}".
-        With initial=True a single attempt starts at the next clock tick (SV: a
-        concurrent assertion in an initial block), e.g. for `always ...`.
+        A new attempt starts at every clock tick and runs alongside the test.
+        A failure is logged at the tick where it is decided, with the start
+        time of the attempt and the sampled values, and collected for the
+        end of the test::
+
+            a.assert_property("req |-> ##[1:3] ack", name="req_gets_ack")
+            a.assert_property("out_valid |-> out_data == expected",
+                              values={"expected": model.peek})
+
+        Args:
+            prop: the property in SVA, or a `Property` called with its
+                arguments. The text may start with its own clocking event
+                (`@(posedge clk) ...`) and `disable iff (...)`, which take
+                precedence over the arguments below, and may change clocks
+                inside (multi-clock properties).
+            name: name in reports; by default `assert<n>`. The group's name
+                is put in front.
+            clock: clocking event of this assertion instead of the group's;
+                same forms as `Assertions`' `clock`.
+            disable_iff: condition instead of the group's; `None` for no
+                `disable iff`.
+            signals: name -> handle, aliases for this assertion.
+            values: name -> Python callable, called at every clock tick for
+                the value of that name (e.g. a reference model).
+            severity: "info", "warning", "error" (the default) or "fatal".
+                Only "error" and "fatal" fail the test; "fatal" also raises
+                `AssertionError` at once, stopping the test.
+            message: added to the failure report. `{path}` is replaced by
+                the value of that signal: "count={u_ctrl.count}".
+            on_fail: called with the `Failure` after it is logged.
+            on_pass: called with the `AssertionHandle` at every
+                non-vacuous pass.
+            initial: start a single attempt at the next clock tick instead of
+                one per tick, like a concurrent assertion in an SV `initial`
+                block (for `always ...`, `s_eventually ...`).
+
+        Returns:
+            The `AssertionHandle`, with its counters in `stats`.
+
+        Raises:
+            SvaSyntaxError: `prop` is not valid SVA.
+            SvaNameError: a name in it is not found.
+            SvaUnsupportedError: it uses SVA this version does not support.
+            SvaError: no clock is given anywhere.
         """
         return self._add("assert", prop, name, clock, disable_iff, signals, values, severity, message,
                          on_fail, on_pass, initial)
 
     def assume_property(self, prop, name: str | None = None, **kw) -> AssertionHandle:
-        """SV `assume property` (checked like an assertion in simulation)."""
+        """SV `assume property`: checked like an assertion in simulation.
+
+        Takes the same arguments as `assert_property`, and is reported as
+        an assumption (named `assume<n>` by default).
+
+        Returns:
+            The `AssertionHandle`.
+        """
         kw.setdefault("disable_iff", ...)
         return self._add("assume", prop, name, kw.pop("clock", None), kw.pop("disable_iff"),
                          kw.pop("signals", None), kw.pop("values", None), kw.pop("severity", "error"),
@@ -1311,7 +1515,27 @@ class Assertions:
     def cover_property(self, prop, name: str | None = None, *, clock=None, disable_iff=...,
                        signals: dict | None = None, values: dict | None = None,
                        on_hit: Callable | None = None, initial: bool = False) -> AssertionHandle:
-        """Count matches of a property or sequence (SV `cover property`)."""
+        """Count matches of a property or sequence, SV `cover property`.
+
+        An attempt starts at every clock tick; each one that matches is a
+        hit. Hits are in the end-of-test summary and in `stats`; a cover
+        never fails the test::
+
+            a.cover_property("req ##1 req ##1 req", name="three_reqs")
+
+        Args:
+            prop: the sequence or property in SVA, or a called `Property`.
+            name: name in reports; by default `cover<n>`.
+            clock: clocking event instead of the group's.
+            disable_iff: condition instead of the group's; `None` for none.
+            signals: name -> handle, aliases for this cover.
+            values: name -> Python callable sampled at every clock tick.
+            on_hit: called with the `AssertionHandle` at every hit.
+            initial: a single attempt, from the next clock tick.
+
+        Returns:
+            The `AssertionHandle`; `stats["hits"]` counts the hits.
+        """
         return self._add("cover", prop, name, clock, disable_iff, signals, values, "info", None, None,
                          on_hit, initial)
 
@@ -1319,12 +1543,29 @@ class Assertions:
                      signals: dict | None = None, values: dict | None = None,
                      severity: str = "error", message: str | None = None,
                      timeout: int | None = None) -> bool:
-        """Wait for one evaluation of a property that starts at the next clock
-        tick (SV `expect`). Returns True when it holds; a failure is reported
-        like an assertion failure and returns False.
+        """Wait for one evaluation of a property, SV `expect`.
 
-        `timeout` (clock ticks) ends a still-pending evaluation with the
-        end-of-test rule: weak obligations hold, strong ones fail.
+        A single attempt starts at the next clock tick; the coroutine returns
+        when it is decided::
+
+            ok = await a.expect("##[1:20] done", timeout=100)
+
+        Args:
+            prop: the property in SVA, or a called `Property`.
+            name: name in reports; by default `expect<n>`.
+            clock: clocking event instead of the group's.
+            disable_iff: condition instead of the group's; `None` for none.
+            signals: name -> handle, aliases for this evaluation.
+            values: name -> Python callable sampled at every clock tick.
+            severity: severity of a failure, as in `assert_property`.
+            message: added to the failure report.
+            timeout: clock ticks after which a still-pending evaluation ends
+                with the end-of-test rule: weak obligations hold, strong ones
+                fail. `None` waits for as long as it takes.
+
+        Returns:
+            True when the property holds; False when it fails (the failure is
+            reported like an assertion failure).
         """
         h = self._add("assert", prop, name or f"expect{self.root._count + 1}", clock, disable_iff,
                       signals, values, severity, message, None, None, True)
@@ -1606,24 +1847,61 @@ class Assertions:
     # -- immediate assertions -----------------------------------------------
     def check(self, expr, msg: str | None = None, *, name: str | None = None, deferred: bool = False,
               severity: str = "error", signals: dict | None = None, values: dict | None = None) -> bool | None:
-        """Immediate assertion (SV `assert (expr) else $error(msg)`).
+        """Immediate assertion, SV `assert (expr) else $error(msg)`.
 
-        `expr` is an SVA expression string or a Python callable returning a bool.
-        A failure is logged at the current simulation time and collected; the
-        test continues. With deferred=True the check runs once at the end of
-        the current time step (ReadOnly phase), and only the last call per
-        name/call site in that time step counts (SV `assert #0`).
+        Evaluated now, with the current values. A failure is logged at the
+        current simulation time and collected; the test continues::
+
+            a.check("count == 0", msg="counter not cleared")
+            a.check(lambda: model.empty())
+
+        Args:
+            expr: an SVA expression, or a Python callable returning a bool.
+            msg: added to the failure report.
+            name: name in reports and `stats`; by default the calling
+                function and line.
+            deferred: evaluate at the end of the current time step (the
+                ReadOnly phase) instead, like SV `assert #0`; only the last
+                call per name (or call site) in a time step counts.
+            severity: "info", "warning", "error" (the default) or "fatal".
+            signals: name -> handle, aliases for this check.
+            values: name -> Python callable giving the value of that name.
+
+        Returns:
+            True or False: whether `expr` holds. None when deferred.
         """
         return self._immediate("assert", expr, msg, name, deferred, severity, signals, values)
 
     def assume(self, expr, msg: str | None = None, **kw):
-        """Immediate assumption (checked like an assertion in simulation)."""
+        """Immediate assumption: checked like `check` in simulation.
+
+        Takes the same arguments as `check` (`name`, `deferred`, `severity`,
+        `signals`, `values` by keyword).
+
+        Returns:
+            Whether `expr` holds; None when deferred.
+        """
         return self._immediate("assume", expr, msg, kw.get("name"), kw.get("deferred", False),
                                kw.get("severity", "error"), kw.get("signals"), kw.get("values"))
 
     def cover(self, expr, name: str | None = None, *, signals: dict | None = None,
               values: dict | None = None) -> bool:
-        """Immediate cover: counts how often `expr` is true when called."""
+        """Immediate cover: counts the calls where `expr` is true.
+
+        ::
+
+            a.cover("state == S_DONE", name="done_seen")
+
+        Args:
+            expr: an SVA expression, or a Python callable returning a bool.
+            name: name in reports and `stats`; by default the calling
+                function and line.
+            signals: name -> handle, aliases for this cover.
+            values: name -> Python callable giving the value of that name.
+
+        Returns:
+            Whether `expr` is true now.
+        """
         return self._immediate("cover", expr, None, name, False, "info", signals, values)
 
     def _immediate(self, kind, expr, msg, name, deferred, severity, signals, values):
@@ -1759,13 +2037,25 @@ class Assertions:
         return [h for h in self.root.assertions if fnmatchcase(h.name, pattern)]
 
     def off(self, pattern: str = "*"):
-        """Stop starting new attempts ($assertoff); attempts in flight complete."""
+        """Stop starting new attempts, SV `$assertoff`; attempts in flight complete.
+
+        Args:
+            pattern: `fnmatch` pattern of assertion names, relative to this
+                group's name ("*", "fifo_*") or full ("top.fifo_*").
+        """
         for h in self._matching(self._full_pattern(pattern)):
             h.domain.wake()
             h.monitor.enabled = False
 
     def on(self, pattern: str = "*"):
-        """Resume starting attempts ($asserton)."""
+        """Start new attempts again, SV `$asserton`.
+
+        A single-attempt assertion (`initial=True`) whose attempt has already
+        started stays off.
+
+        Args:
+            pattern: `fnmatch` pattern of assertion names, as in `off`.
+        """
         for h in self._matching(self._full_pattern(pattern)):
             if h.initial and h.monitor.stats.attempts:
                 continue            # its single attempt has started already
@@ -1773,7 +2063,13 @@ class Assertions:
             h.monitor.enabled = True
 
     def kill(self, pattern: str = "*"):
-        """Abort attempts in flight and stop starting new ones ($assertkill)."""
+        """Abort the attempts in flight and stop starting new ones, SV `$assertkill`.
+
+        `on` starts new attempts again.
+
+        Args:
+            pattern: `fnmatch` pattern of assertion names, as in `off`.
+        """
         for h in self._matching(self._full_pattern(pattern)):
             h.domain.wake()
             h.monitor.kill()
@@ -1786,18 +2082,41 @@ class Assertions:
 
     # -- results and finalization -------------------------------------------
     def stats(self) -> dict:
-        """name -> counters (attempts, passes, vacuous, failures, ...)."""
+        """Counters of every assertion so far.
+
+        Returns:
+            Assertion name -> counters. Concurrent assertions have the
+            counters of `AssertionHandle.stats`. Immediate ones have `kind`,
+            `evaluations`, `failures` and `hits`.
+        """
         out = {h.name: h.stats for h in self.root.assertions}
         out.update(self.root.immediate_stats)
         return out
 
     @property
     def errors(self) -> list:
+        """The `Failure` objects so far with severity "error" or "fatal": those that fail the test."""
         return [f for f in self.root.failures if f.severity in ("error", "fatal")]
 
     def finalize(self, raise_on_failure: bool = True) -> list:
-        """End checking: report pending strong obligations, log a summary, and
-        raise AssertionError if any assertion failed with severity error/fatal."""
+        """End checking for the group.
+
+        Stops the assertions, reports strong obligations still pending as
+        failures (`Failure.at_end`), logs the summary and, if an assertion
+        failed with severity "error" or "fatal", raises `AssertionError`.
+        Called for you by `checked` and at the end of `async with`; calling
+        it again does nothing.
+
+        Args:
+            raise_on_failure: False returns the failures instead of raising.
+
+        Returns:
+            The `Failure` objects with severity "error" or "fatal".
+
+        Raises:
+            AssertionError: an assertion failed (unless `raise_on_failure`
+                is False).
+        """
         root = self.root
         if root._finalized:
             return root.errors
@@ -1873,11 +2192,27 @@ def _enum_dict(enums) -> dict:
 
 
 def checked(func):
-    """Decorator for cocotb tests: collect assertion failures and fail the test at its end.
+    """Decorator for cocotb tests: fail the test at its end if an assertion failed.
+
+    Put it below `@cocotb.test()`::
 
         @cocotb.test()
         @checked
-        async def test_traffic(dut): ...
+        async def test_traffic(dut):
+            a = Assertions(dut, clock=posedge(dut.clk))
+            ...
+
+    When the test returns, every `Assertions` group created during it is
+    finalized (see `Assertions.finalize`): pending strong obligations fail,
+    the summary is logged, and the test fails with an `AssertionError`
+    naming the failed assertions. If the test raises, the groups are
+    finalized and the test's own exception is kept.
+
+    Without it (or `async with`, or `finalize`), failures are logged but the
+    test passes; an error at the end says so.
+
+    Raises:
+        TypeError: the decorated function is not an `async def`.
     """
     if not inspect.iscoroutinefunction(func):
         raise TypeError("@checked must decorate an async test function")
@@ -1906,9 +2241,11 @@ def checked(func):
 
 
 class Checker:
-    """Reusable bundle of assertions with ports, like an SV checker bound with `bind`.
+    """A reusable bundle of assertions with ports, like an SV checker bound
+    with `bind`.
 
-    Example::
+    Subclass it, list the ports and write the assertions in `build`; then
+    create one instance per place to check::
 
         class StreamChecker(Checker):
             ports = ("clk", "rst_n", "valid", "ready", "data")
@@ -1921,7 +2258,26 @@ class Checker:
         StreamChecker(a, name="in", clk=dut.clk, rst_n=dut.rst_n, valid=dut.in_valid, ...)
         StreamChecker(a, name="lane0", scope=dut.g_lane[0])   # ports found by name in scope
 
-    A port can be bound to a handle or to an expression string.
+    The assertions are in a child group of `group`: their names are
+    `<group name>.<checker name>.<assertion name>`, and their failures and
+    counters go to `group`.
+
+    Attributes:
+        ports: names of the ports, usable in the assertions.
+        clock: default clock of the checker's assertions, in the forms
+            `Assertions` takes (usually a string naming a port: "posedge clk").
+        disable_iff: default `disable iff` condition of the checker.
+
+    Args:
+        group: the `Assertions` group the checker belongs to.
+        name: name of this instance; by default the class name.
+        scope: where names (and unbound ports) are looked up; by default the
+            group's scope.
+        **bindings: port name -> signal handle or SVA expression (a string).
+            A port left out is looked up by its name in `scope`.
+
+    Raises:
+        TypeError: a binding names a port the checker does not have.
     """
     ports: tuple = ()
     clock = None
@@ -1947,4 +2303,10 @@ class Checker:
         self.build(self.assertions)
 
     def build(self, a: Assertions):
+        """Create the checker's assertions; subclasses implement it.
+
+        Args:
+            a: the checker's own `Assertions` group, with the ports bound,
+                the checker's `clock` and `disable_iff`, and its scope.
+        """
         raise NotImplementedError("Checker subclasses implement build(self, a)")
