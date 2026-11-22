@@ -27,6 +27,11 @@ from ._parser import parse_assertion, parse_expression, parse_sequence_or_proper
 from ._prop import FAIL, PASS
 
 _log = logging.getLogger("sva")
+# cocotb shows INFO only for its own loggers: show the end-of-test summary,
+# sampling notes and severity="info" failures by default. A level set by the
+# user (before or after the import) wins.
+if _log.level == logging.NOTSET:
+    _log.setLevel(logging.INFO)
 
 SEVERITIES = ("info", "warning", "error", "fatal")
 SAMPLINGS = ("auto", "edge", "preponed")
