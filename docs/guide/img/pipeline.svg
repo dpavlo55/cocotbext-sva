@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 340" width="760" height="340" role="img" aria-labelledby="t">
+  <title id="t">From SVA text to a check at every clock tick</title>
+  <style>
+    text { font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; fill: #2d2a4a; }
+    .lane { font-size: 15px; font-weight: 700; fill: #7c6fd6; }
+    .box { fill: #ffffff; stroke: #b9b2ec; stroke-width: 1.5; }
+    .hot { fill: #f3efff; stroke: #7c6fd6; stroke-width: 2; }
+    .t1 { font-size: 14px; font-weight: 600; }
+    .t2 { font-size: 12px; fill: #6b6880; }
+    .code { font-family: Consolas, "DejaVu Sans Mono", monospace; font-size: 12px; fill: #2d2a4a; }
+    .arrow { stroke: #7c6fd6; stroke-width: 2; fill: none; marker-end: url(#head); }
+    .dash { stroke: #2bb3a3; stroke-width: 2; fill: none; stroke-dasharray: 6 5; marker-end: url(#headg); }
+  </style>
+  <defs>
+    <marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#7c6fd6"/>
+    </marker>
+    <marker id="headg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#2bb3a3"/>
+    </marker>
+  </defs>
+  <rect x="1" y="1" width="758" height="338" rx="14" fill="#fafaff" stroke="#e4e0fa"/>
+
+  <!-- once -->
+  <text x="24" y="34" class="lane">① Once, when the assertion is created</text>
+  <rect x="16" y="50" width="132" height="66" rx="10" class="box"/>
+  <text x="82" y="74" text-anchor="middle" class="t1">Your property</text>
+  <text x="82" y="98" text-anchor="middle" class="code">req |-&gt; ##[1:3] ack</text>
+
+  <rect x="172" y="50" width="120" height="66" rx="10" class="box"/>
+  <text x="232" y="78" text-anchor="middle" class="t1">Parser</text>
+  <text x="232" y="98" text-anchor="middle" class="t2">checks the syntax</text>
+
+  <rect x="316" y="50" width="120" height="66" rx="10" class="box"/>
+  <text x="376" y="78" text-anchor="middle" class="t1">Syntax tree</text>
+  <text x="376" y="98" text-anchor="middle" class="t2">names resolved</text>
+
+  <rect x="460" y="50" width="120" height="66" rx="10" class="box"/>
+  <text x="520" y="78" text-anchor="middle" class="t1">Compiler</text>
+  <text x="520" y="98" text-anchor="middle" class="t2">builds the machine</text>
+
+  <rect x="604" y="50" width="140" height="66" rx="10" class="hot"/>
+  <text x="674" y="74" text-anchor="middle" class="t1">Automaton</text>
+  <text x="674" y="92" text-anchor="middle" class="t2">+ generated Python</text>
+  <text x="674" y="107" text-anchor="middle" class="t2">for the conditions</text>
+
+  <path d="M148 83 H168" class="arrow"/>
+  <path d="M292 83 H312" class="arrow"/>
+  <path d="M436 83 H456" class="arrow"/>
+  <path d="M580 83 H600" class="arrow"/>
+
+  <!-- every tick -->
+  <text x="24" y="182" class="lane">② At every clock tick</text>
+  <rect x="16" y="198" width="210" height="84" rx="10" class="box"/>
+  <text x="121" y="224" text-anchor="middle" class="t1">Sampler</text>
+  <text x="121" y="244" text-anchor="middle" class="t2">reads the signals the</text>
+  <text x="121" y="260" text-anchor="middle" class="t2">assertions need right now</text>
+
+  <rect x="276" y="198" width="210" height="84" rx="10" class="hot"/>
+  <text x="381" y="224" text-anchor="middle" class="t1">Engine</text>
+  <text x="381" y="244" text-anchor="middle" class="t2">one step of the automaton:</text>
+  <text x="381" y="260" text-anchor="middle" class="t2">a table lookup, usually</text>
+
+  <rect x="536" y="198" width="208" height="84" rx="10" class="box"/>
+  <text x="640" y="224" text-anchor="middle" class="t1">Reporter</text>
+  <text x="640" y="244" text-anchor="middle" class="t2">logs failures as they happen,</text>
+  <text x="640" y="260" text-anchor="middle" class="t2">counts passes and cover hits</text>
+
+  <path d="M226 240 H272" class="arrow"/>
+  <text x="249" y="232" text-anchor="middle" class="t2">values</text>
+  <path d="M486 240 H532" class="arrow"/>
+  <text x="509" y="232" text-anchor="middle" class="t2">events</text>
+
+  <!-- the automaton is what the engine steps -->
+  <path d="M674 116 V150 H381 V194" class="dash"/>
+  <text x="530" y="144" text-anchor="middle" class="t2">the engine steps this machine</text>
+
+  <text x="121" y="306" text-anchor="middle" class="t2">clock edge · start of time step</text>
+  <text x="121" y="322" text-anchor="middle" class="t2">· Probe buffer · VCD / FST dump</text>
+  <text x="381" y="314" text-anchor="middle" class="t2">never talks to the simulator</text>
+</svg>

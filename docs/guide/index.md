@@ -29,6 +29,10 @@ implementation, simulator-specific behaviour and measurements are in the
 [Speed and the compiled kernel](speed.md)
 : What an assertion costs per clock cycle, with and without the kernel.
 
+[How the engine works](how-it-works.md)
+: Attempts, how they are merged into one state machine, and when values are
+  sampled, with diagrams.
+
 ```{toctree}
 :hidden:
 
@@ -39,4 +43,5 @@ offline
 supported-sva
 semantics
 speed
+how-it-works
 ```
