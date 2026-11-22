@@ -2,7 +2,7 @@
 name = "cocotbext-sva-kernel"
 version = "0.1.0-dev0"
 edition = "2021"
-license = "BSD-3-Clause"
+license = "MIT"
 description = "Optional compiled evaluation kernel for cocotbext-sva"
 publish = false
 
