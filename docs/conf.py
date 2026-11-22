@@ -1,5 +1,9 @@
 """Sphinx configuration (local build: `nox -s docs`; Read the Docs: .readthedocs.yaml)."""
+import sys
 from importlib.metadata import version as _version
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "_ext"))   # local extensions
 
 project = "cocotbext-sva"
 author = "David Pavlović"
@@ -14,10 +18,11 @@ extensions = [
     "sphinx.ext.intersphinx",
     "sphinx.ext.viewcode",
     "sphinx_copybutton",
+    "wavedrom_svg",           # ```{wavedrom} timing diagrams (_ext/wavedrom_svg.py)
 ]
 
 source_suffix = {".md": "markdown"}
-exclude_patterns = ["_build"]
+exclude_patterns = ["_build", "_ext"]
 
 # the docstrings write `name` for code, as in Markdown
 default_role = "literal"
@@ -37,6 +42,7 @@ intersphinx_mapping = {
 html_theme = "furo"
 html_title = f"cocotbext-sva {release}"
 html_static_path = ["_static"]
+html_css_files = ["custom.css"]
 html_favicon = "_static/logo-icon.svg"
 html_theme_options = {
     "light_logo": "logo-icon.svg",   # the owl above the project name in the sidebar
