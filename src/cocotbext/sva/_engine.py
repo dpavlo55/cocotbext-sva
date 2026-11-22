@@ -163,7 +163,7 @@ class Monitor:
     @property
     def n_attempts(self) -> int:
         if self._gated:
-            return self._att
+            return self._att + (self._k.K.attempts(self._kj) if self._k is not None else 0)
         return self._att + (self.domain.ev - self._en_ev if self._enabled else 0)
 
     def settle(self):
@@ -781,8 +781,18 @@ def make_kernel(domain):
 
 
 def _kernel_eligible(m, step):
-    return (getattr(step, "__func__", None) is Monitor.tick and step.__self__ is m
-            and len(m.prog.atoms) <= 63)
+    if len(m.prog.atoms) > 63 or m.prog.envmode:
+        return False
+    if type(step) is GatedStep:        # multi-clock: needs a kernel that gates starts
+        return step.mon is m and not step.once and hasattr(_kmod.Kernel, "set_gate")
+    return getattr(step, "__func__", None) is Monitor.tick and step.__self__ is m
+
+
+def _gate_code(step):
+    """Phase A atom of a gated monitor: its leading clock ticks."""
+    from ._expr import Code
+    s = step.slot
+    return Code(f"(v{s} != 0)", {s})
 
 
 def build_runner(entries, kd=None):
@@ -863,7 +873,7 @@ def _kernel_part(entries, kd, ns, total):
     for the words tick_a asks for, passed to tick_b)."""
     from ._compile import _prelude
     from ._expr import Code
-    mons = []
+    mons, gates = [], {}
     for m, step in entries:
         if m._kj is None:
             if not _kernel_eligible(m, step):
@@ -872,6 +882,8 @@ def _kernel_part(entries, kd, ns, total):
             kd.register(m)
         if m._k is not None:
             mons.append(m)
+            if type(step) is GatedStep:
+                gates[m] = _gate_code(step)
     active = {m._kj for m in mons}
     for j in range(len(kd.mons)):
         if j not in active:
@@ -880,6 +892,10 @@ def _kernel_part(entries, kd, ns, total):
         return []
     # atom layout
     a_idx, b_idx, a_codes, b_codes = {}, {}, [], []
+    for code in gates.values():
+        if code.text not in a_idx:
+            a_idx[code.text] = len(a_codes)
+            a_codes.append(code)
     for m in mons:
         need0 = m._gs_list[0].need
         for i, code in enumerate(m.prog.atoms):
@@ -905,6 +921,8 @@ def _kernel_part(entries, kd, ns, total):
                 amap.append(na + g)
                 bneed |= 1 << (g >> 6)
         kd.K.set_inputs(m._kj, amap, bneed)
+        if m in gates:
+            kd.K.set_gate(m._kj, a_idx[gates[m].text])
 
     def words(codes):
         out = []

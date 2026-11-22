@@ -13,6 +13,10 @@
 //! monitor (steps the idle monitors, returns which busy-state inputs are
 //! needed), then, if needed, `tick_b` with those (steps the busy monitors and
 //! returns the events to report).
+//!
+//! A gated monitor (multi-clock assertion) starts an attempt only at the
+//! ticks where its gate, a phase A atom (the leading clock ticks), is true;
+//! the kernel counts those attempts.
 
 mod fst;
 
@@ -28,6 +32,7 @@ const DISABLED: i32 = 4;
 const VFAIL: i32 = 5;
 const NONE: i32 = i32::MIN; // no new attempt / idle_v None
 const BUSY: i32 = 1; // idle_v of a monitor with attempts in flight
+const NO_GATE: u32 = u32::MAX;
 const CACHE_LIMIT: usize = 100_000;
 
 #[derive(Default)]
@@ -104,6 +109,8 @@ struct State {
     bneed: u64,       // phase B words the monitor's atoms use (0: all in phase A)
     sb: u64,
     start_bit: u64,
+    gate: u32,     // phase A atom that must be true to start an attempt (NO_GATE: none)
+    gated: u64,    // attempts started by a gated monitor
     state: u32,
     meta: Vec<Meta>,
     spare: Vec<Meta>, // scratch buffer for the next meta vector
@@ -118,6 +125,19 @@ struct State {
 }
 
 impl State {
+    /// The start bit of this tick (gate applied, gated attempts counted).
+    #[inline]
+    fn start(&mut self, a: &[u64]) -> u64 {
+        if self.gate == NO_GATE || self.sb == 0 {
+            return self.sb;
+        }
+        if (a[(self.gate >> 6) as usize] >> (self.gate & 63)) & 1 == 0 {
+            return 0;
+        }
+        self.gated += 1;
+        self.sb
+    }
+
     fn sleepable(&self) -> bool {
         match self.idle_v {
             NONE => true,
@@ -360,6 +380,8 @@ impl Kernel {
                 bneed: 0,
                 sb: start_bit,
                 start_bit,
+                gate: NO_GATE,
+                gated: 0,
                 state: 0,
                 meta: Vec::new(),
                 spare: Vec::new(),
@@ -389,6 +411,17 @@ impl Kernel {
         self.mons[j].st.bneed = bneed;
     }
 
+    /// Gate the monitor's attempts on a phase A atom (None: ungated).
+    #[pyo3(signature = (j, atom))]
+    fn set_gate(&mut self, j: usize, atom: Option<u32>) {
+        self.mons[j].st.gate = atom.unwrap_or(NO_GATE);
+    }
+
+    /// Attempts started by a gated monitor.
+    fn attempts(&self, j: usize) -> u64 {
+        self.mons[j].st.gated
+    }
+
     fn set_enabled(&mut self, j: usize, enabled: bool) {
         let st = &mut self.mons[j].st;
         st.sb = if enabled { st.start_bit } else { 0 };
@@ -416,7 +449,8 @@ impl Kernel {
                 continue;
             }
             if st.state == 0 || st.bneed == 0 {
-                let key = gather(&st.amap, m.tab.need[st.state as usize], na, &self.a, &[]) | st.sb;
+                let key = gather(&st.amap, m.tab.need[st.state as usize], na, &self.a, &[]);
+                let key = key | self.mons[j].st.start(&self.a);
                 self.step(py, j, key, tick)?;
             } else {
                 need |= st.bneed;
@@ -438,7 +472,8 @@ impl Kernel {
         let na = self.na;
         for &j in busy.iter() {
             let m = &self.mons[j];
-            let key = gather(&m.st.amap, m.tab.need[m.st.state as usize], na, &self.a, &b) | m.st.sb;
+            let key = gather(&m.st.amap, m.tab.need[m.st.state as usize], na, &self.a, &b);
+            let key = key | self.mons[j].st.start(&self.a);
             self.step(py, j, key, tick)?;
         }
         self.busy = busy;

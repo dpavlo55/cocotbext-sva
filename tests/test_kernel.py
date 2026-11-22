@@ -74,3 +74,44 @@ def test_start_times_survive_pruning(monkeypatch):
     run_trace({"p": "a |-> ##[1:6] b", "q": "a |=> ##[0:20] b"}, SIGNALS, rows)
     assert len(seen) > 5000
     assert all(tick == time for tick, time in seen)
+
+
+def _run_mc(case, kernel, quiet, monkeypatch):
+    from test_corpus_mc import DATA
+    clocks = DATA["clocks"]
+    rows = [row for row in case["trace"] if any(row[c] for c in clocks)]
+    saved = _engine._kmod
+    if not kernel:
+        _engine._kmod = None
+    try:
+        monkeypatch.setattr(_trace._Sink, "wants_pass", not quiet)
+        monkeypatch.setattr(_trace._Sink, "wants_vacuous", not quiet)
+        tr = _trace.TraceRun(case["props"], DATA["signals"], kinds=case["kinds"])
+        for r in rows:
+            tr.step(r)
+        res = tr.finish()
+    finally:
+        _engine._kmod = saved
+    in_kernel = sum(m._k is not None for m in tr.mons)
+    events = {}
+    for e in res.events:
+        events.setdefault(e.assertion, []).append((e.kind, e.tick, e.starts, e.count))
+    return (events, res.stats), in_kernel
+
+
+@pytest.mark.parametrize("quiet", [False, True])
+def test_kernel_matches_python_multiclock(quiet, monkeypatch):
+    """Multi-clock assertions (attempts gated on the leading clock) give the
+    same events and counters in the kernel as in Python."""
+    from test_corpus_mc import DATA
+    checked = in_kernel = 0
+    for case in DATA["cases"]:
+        try:
+            py, _ = _run_mc(case, False, quiet, monkeypatch)
+        except SvaError:
+            continue
+        native, k = _run_mc(case, True, quiet, monkeypatch)
+        assert native == py, case["id"]
+        checked += 1
+        in_kernel += k
+    assert checked > 300 and in_kernel > 300
