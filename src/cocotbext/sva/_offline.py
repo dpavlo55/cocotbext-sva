@@ -358,7 +358,8 @@ class TraceSampler:
         self.scope = scope
         self.disable_iff = disable_iff
         self.params = dict(params or {})
-        self.props: dict = {}
+        self.props: dict = {}               # name -> text, as written
+        self.specs: dict = {}               # name -> parsed AssertionSpec, arguments substituted
         self.kinds: dict = {}
 
     # -- assertions ---------------------------------------------------------
@@ -366,25 +367,47 @@ class TraceSampler:
         name = name or f"{kind}{len(self.props) + 1}"
         if name in self.props:
             raise SvaError(f"duplicate assertion name {name!r}")
-        text = str(getattr(prop, "text", prop))
-        from ._parser import parse_assertion
-        parse_assertion(text)                       # syntax errors now
-        if self.disable_iff and kind != "cover" and "disable iff" not in text:
-            text = f"disable iff ({self.disable_iff}) {text}"
+        from . import _ast as A
+        from ._api import BoundProperty, Property
+        from ._compile import substitute
+        from ._parser import parse_assertion, parse_expression, parse_sequence_or_property
+        if isinstance(prop, BoundProperty):        # actual arguments in place of the formals
+            mapping = {}
+            for k, v in prop.bindings.items():
+                if not isinstance(v, str):
+                    raise SvaError(f"argument {k!r}: offline, actual arguments are names or "
+                                   f"expressions (strings) in the dump, not handles")
+                mapping[k] = parse_sequence_or_property(v)
+            text = prop.text
+            spec = A.AssertionSpec(None, None, substitute(prop.prop.ast, mapping))
+        elif isinstance(prop, Property):
+            if prop.args:
+                raise SvaError("this Property has arguments; call it with actual arguments first")
+            text, spec = prop.text, A.AssertionSpec(None, None, prop.ast)
+        else:
+            text = str(prop)
+            spec = parse_assertion(text)            # syntax errors now
+        if self.disable_iff and kind != "cover" and spec.disable is None:
+            spec = A.AssertionSpec(spec.clock, parse_expression(self.disable_iff), spec.prop,
+                                   span=spec.span)
         self.props[name] = text
+        self.specs[name] = spec
         self.kinds[name] = kind
 
     def assert_property(self, prop, name: str | None = None):
         """Add a concurrent assertion, checked by `run`.
 
         Args:
-            prop: the property, in SVA. It may start with its own clocking
-                event and `disable iff (...)`.
+            prop: the property in SVA, or a `Property` called with its
+                arguments; offline, the actual arguments are names or
+                expressions (strings), not handles. The text may start with
+                its own clocking event and `disable iff (...)`.
             name: name in the results; by default `assert<n>`.
 
         Raises:
             SvaSyntaxError: `prop` is not valid SVA (raised here).
-            SvaError: `name` is already used.
+            SvaError: `name` is already used, or `prop` is a `Property`
+                with arguments not given, or given as handles.
         """
         self._add("assert", prop, name)
 
@@ -392,7 +415,7 @@ class TraceSampler:
         """Add an assumption, checked like an assertion by `run`.
 
         Args:
-            prop: the property, in SVA.
+            prop: the property in SVA, or a called `Property`.
             name: name in the results; by default `assume<n>`.
         """
         self._add("assume", prop, name)
@@ -401,7 +424,7 @@ class TraceSampler:
         """Add a cover, counted by `run`. The default `disable_iff` does not apply to covers.
 
         Args:
-            prop: the sequence or property, in SVA.
+            prop: the sequence or property in SVA, or a called `Sequence`.
             name: name in the results; by default `cover<n>`.
         """
         self._add("cover", prop, name)
@@ -435,7 +458,6 @@ class TraceSampler:
         from ._compile import _Ctx, gen_value_fn
         from ._expr import ExprCompiler
         from ._multiclock import Rewriter, strip_clocks, uses_clocks
-        from ._parser import parse_assertion
         from ._trace import TraceBinder
 
         resolved = {}
@@ -477,7 +499,7 @@ class TraceSampler:
         # group the assertions by the clocks they use
         groups: dict = {}
         for name, text in self.props.items():
-            spec = parse_assertion(text)
+            spec = self.specs[name]
             kind = self.kinds[name]
             first = event_key(spec.clock) if spec.clock is not None else default
             if uses_clocks(spec.prop, {}):
