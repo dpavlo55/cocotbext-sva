@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dpavlo55/cocotbext-sva/main/docs/_static/logo-dark.svg">
+    <img alt="cocotbext-sva" src="https://raw.githubusercontent.com/dpavlo55/cocotbext-sva/main/docs/_static/logo.svg" width="480">
+  </picture>
+</p>
+
 # cocotbext-sva
 
 [![Documentation](https://readthedocs.org/projects/cocotbext-sva/badge/?version=latest)](https://cocotbext-sva.readthedocs.io/en/latest/)

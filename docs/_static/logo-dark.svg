@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 200" width="640" height="200" role="img" aria-labelledby="title">
+  <title id="title">cocotbext-sva: an owl standing on a clock waveform</title>
+  <style>
+    .name    { fill: #ece9ff; }
+    .accent  { fill: #a99cf5; }
+    .tagline { fill: #a8a4c4; }
+    text { font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  </style>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e6f8f5"/>
+      <stop offset="1" stop-color="#bfeee6"/>
+    </linearGradient>
+    <clipPath id="badge"><circle cx="100" cy="100" r="90"/></clipPath>
+  </defs>
+
+  <!-- badge -->
+  <circle cx="100" cy="100" r="90" fill="url(#bg)"/>
+  <g clip-path="url(#badge)">
+    <!-- clock waveform, the owl stands on the wide high pulse -->
+    <path d="M4 158 H30 V138 H48 V158 H66 V138 H134 V158 H152 V138 H170 V158 H196"
+          fill="none" stroke="#2bb3a3" stroke-width="5" stroke-linejoin="round" stroke-linecap="round"/>
+  </g>
+
+  <!-- owl -->
+  <g>
+    <!-- ear tufts -->
+    <path d="M68 60 L60 32 L86 50 Z" fill="#7c6fd6"/>
+    <path d="M132 60 L140 32 L114 50 Z" fill="#7c6fd6"/>
+    <!-- wings -->
+    <ellipse cx="58" cy="104" rx="10" ry="21" transform="rotate(14 58 104)" fill="#6a5cc4"/>
+    <ellipse cx="142" cy="104" rx="10" ry="21" transform="rotate(-14 142 104)" fill="#6a5cc4"/>
+    <!-- body -->
+    <ellipse cx="100" cy="92" rx="44" ry="46" fill="#7c6fd6"/>
+    <!-- belly with a check mark -->
+    <ellipse cx="100" cy="110" rx="27" ry="24" fill="#f3efff"/>
+    <path d="M88 110 L97 119 L113 101" fill="none" stroke="#22c55e" stroke-width="6"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- eyes -->
+    <circle cx="82" cy="78" r="15" fill="#ffffff"/>
+    <circle cx="118" cy="78" r="15" fill="#ffffff"/>
+    <circle cx="84" cy="80" r="8" fill="#2d2a4a"/>
+    <circle cx="116" cy="80" r="8" fill="#2d2a4a"/>
+    <circle cx="87" cy="76" r="3" fill="#ffffff"/>
+    <circle cx="119" cy="76" r="3" fill="#ffffff"/>
+    <!-- beak -->
+    <path d="M95 92 L105 92 L100 100 Z" fill="#ffb547" stroke="#ffb547" stroke-width="2" stroke-linejoin="round"/>
+    <!-- cheeks -->
+    <ellipse cx="68" cy="95" rx="6" ry="4" fill="#ff9fb2" opacity="0.85"/>
+    <ellipse cx="132" cy="95" rx="6" ry="4" fill="#ff9fb2" opacity="0.85"/>
+    <!-- feet on the pulse -->
+    <ellipse cx="88" cy="138" rx="7" ry="4" fill="#ffb547"/>
+    <ellipse cx="112" cy="138" rx="7" ry="4" fill="#ffb547"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="212" y="108" font-size="54" font-weight="700"><tspan class="name">cocotbext</tspan><tspan class="accent">-sva</tspan></text>
+  <text x="214" y="144" font-size="20" class="tagline">SystemVerilog assertions for cocotb</text>
+</svg>
