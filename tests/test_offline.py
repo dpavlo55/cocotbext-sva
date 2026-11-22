@@ -343,3 +343,34 @@ def test_property_clocks_offline(tmp_path):
         bad = TraceSampler(path, clock="posedge clk", scope="tb.dut")
         bad.assert_property("a |=> @(posedge nope) b")
         bad.run()
+
+
+def test_property_with_arguments_offline(tmp_path):
+    """A Property called with actual arguments checks the actual signals."""
+    from cocotbext.sva import Property, Sequence
+    rows = [{"req": 1, "gnt": 0, "rst": 0}, {"req": 1, "gnt": 1, "rst": 0},
+            {"req": 0, "gnt": 0, "rst": 1}, {"req": 1, "gnt": 0, "rst": 1}]
+    path = tmp_path / "w.vcd"
+    write_vcd(path, rows, {"req": 1, "gnt": 1, "rst": 1})
+    HANDSHAKE = Property("x |-> y", args=("x", "y"))
+
+    def failures(prop, **kw):
+        ts = TraceSampler(path, clock="posedge clk", scope="tb.dut", **kw)
+        ts.assert_property(prop, name="p")
+        return [f.time_ns for f in ts.run().failures]
+
+    assert failures(HANDSHAKE(x="req", y="gnt")) == failures("req |-> gnt") == [5, 35]
+    assert failures(HANDSHAKE("req", "!gnt")) == failures("req |-> !gnt") == [15]
+    # the default disable iff applies to it as to text
+    assert failures(HANDSHAKE("req", "gnt"), disable_iff="rst") == [5]
+    # a Property without arguments, and a Sequence in a cover
+    assert failures(Property("req |-> gnt")) == [5, 35]
+    ts = TraceSampler(path, clock="posedge clk", scope="tb.dut")
+    ts.cover_property(Sequence("x ##1 x", args=("x",))("req"), name="c")
+    assert ts.run().stats["c"]["hits"] == 1
+    # errors: arguments still to give, and a handle (offline needs names)
+    ts = TraceSampler(path, clock="posedge clk", scope="tb.dut")
+    with pytest.raises(SvaError, match="call it with actual arguments"):
+        ts.assert_property(HANDSHAKE)
+    with pytest.raises(SvaError, match="names or expressions"):
+        ts.assert_property(HANDSHAKE(x=object(), y="gnt"))
