@@ -173,6 +173,11 @@ on. Each cycle the sampling loop reads only the union of signals required by the
 current states of all assertions on that clocking event. An idle
 `req |-> ##[1:3] ack` reads only `req`.
 
+`seq.triggered` (phase 4) is a channel like those of the sampled-value
+functions, but computed at each tick before the assertions: an `Endpoint`
+steps the sequence's automaton with an attempt starting at every tick and
+yields 1 when a match ends. A domain with such a channel does not sleep.
+
 Always-read signals: operands of `$past` / `$rose` / `$fell` / `$stable` /
 `$changed` (their history must be continuous), kept in ring buffers sized by the
 largest `$past` depth. `disable iff` operands are read only when the assertion
@@ -424,7 +429,7 @@ assertion per cycle.
    statistics, vacuity warnings; idle sleep.
 3. **Speed:** optional compiled kernel, offline `TraceSampler`.
 4. **Clocking extensions:** `PreponedSampler` (done), multi-clock sequences
-   (done), `.triggered` / `.ended`, `ProbeSampler`: in progress, see
+   (done), `.triggered` / `.ended` (done), `ProbeSampler`: in progress, see
    `phase4-results.md`. The library of ready-made checkers is deferred to a
    later phase.
 
