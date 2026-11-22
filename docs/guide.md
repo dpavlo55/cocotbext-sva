@@ -202,6 +202,12 @@ async with Assertions(dut, ...) as a:       # check only inside the block
 a.stats()                                   # per-assertion counters
 ```
 
+At the end of a test (or of the `async with` block) a summary of every
+assertion is logged: attempts, passes, vacuous successes, failures and cover
+hits. Everything is logged on the `sva` logger, failures on `sva.<name>`, at
+INFO level by default; `logging.getLogger("sva").setLevel(logging.WARNING)`
+leaves out the summary and the other INFO messages.
+
 ## Supported SVA
 
 | Area | Supported |
