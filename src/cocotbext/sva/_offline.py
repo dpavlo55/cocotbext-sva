@@ -13,7 +13,7 @@ import re
 from array import array
 from dataclasses import dataclass, field
 
-from ._errors import SvaError
+from ._errors import SvaError, SvaUnsupportedError
 from ._prop import FAIL
 from ._trace import TraceRun
 
@@ -300,6 +300,13 @@ class TraceSampler:
         if name in self.props:
             raise SvaError(f"duplicate assertion name {name!r}")
         text = str(getattr(prop, "text", prop))
+        from ._multiclock import has_clocks
+        from ._parser import parse_assertion
+        spec = parse_assertion(text)
+        if spec.clock is not None or has_clocks(spec.prop):
+            raise SvaUnsupportedError(
+                f"{name}: clocking events in the property are not supported offline "
+                f"(one clock per TraceSampler: {self.clock_name})")
         if self.disable_iff and kind != "cover" and "disable iff" not in text:
             text = f"disable iff ({self.disable_iff}) {text}"
         self.props[name] = text

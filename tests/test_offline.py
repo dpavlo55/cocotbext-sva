@@ -221,3 +221,11 @@ def test_fst_without_kernel_is_a_clear_error(tmp_path, monkeypatch):
     ts.assert_property("a")
     with pytest.raises(SvaError, match="reading FST needs the compiled kernel"):
         ts.run()
+
+
+def test_clocking_events_are_rejected(tmp_path):
+    from cocotbext.sva import SvaUnsupportedError, TraceSampler
+    ts = TraceSampler(tmp_path / "none.vcd", clock="posedge clk")
+    for text in ("@(posedge clk) a |=> b", "a |=> @(posedge clk2) b"):
+        with pytest.raises(SvaUnsupportedError, match="one clock per TraceSampler"):
+            ts.assert_property(text)

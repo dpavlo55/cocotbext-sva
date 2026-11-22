@@ -497,7 +497,7 @@ class ExprCompiler:
                     self.err("$past depth must be at least 1", node)
             gate = args[2] if len(args) > 2 else None
             if len(args) > 3 and args[3] is not None:
-                self.err("$past with a clocking event is not supported yet", node, SvaUnsupportedError)
+                self.err("$past with a clocking event is not supported here", node, SvaUnsupportedError)
             self._no_locals(e, node)
             k = self.r.history_channel("past", e, depth, gate)
             we, se = self.type(e)
@@ -505,7 +505,12 @@ class ExprCompiler:
         if n in ("$rose", "$fell", "$stable", "$changed"):
             e = args[0]
             self._no_locals(e, node)
-            k = self.r.history_channel("past", e, 1, None)
+            # second argument: a clocking event in SVA; _multiclock replaces it
+            # by a gating expression (the ticks of that clock)
+            gate = args[1] if len(args) > 1 else None
+            if isinstance(gate, A.ClockEvent):
+                self.err(f"{n} with a clocking event is not supported here", node, SvaUnsupportedError)
+            k = self.r.history_channel("past", e, 1, gate)
             we, se = self.type(e)
             cur = self.gen(e, we, se)
             p = f"H[{k}]"

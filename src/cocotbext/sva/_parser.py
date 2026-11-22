@@ -124,6 +124,11 @@ class Parser:
     # -- properties (lowest precedence first) -------------------------------
     def parse_prop(self) -> A.Node:
         t = self.tok
+        if self.at("@"):
+            # a clocking event applies to the rest of the expression at this
+            # level (it does not extend out of enclosing parentheses)
+            ev = self.parse_clock_event()
+            return A.Clocked(ev, self.parse_prop(), span=self.span_from(t.pos))
         if t.kind == "kw" and t.text in _PREFIX_PROPS:
             return self.parse_prefix_prop()
         return self.parse_impl()
@@ -176,6 +181,10 @@ class Parser:
 
     def _rhs_prop(self, sub):
         t = self.tok
+        if self.at("@"):
+            # the clocking event applies as far as the expression extends
+            ev = self.parse_clock_event()
+            return A.Clocked(ev, self.parse_prop(), span=self.span_from(t.pos))
         if t.kind == "kw" and t.text in _PREFIX_PROPS:
             return self.parse_prefix_prop()
         return sub()
@@ -281,7 +290,15 @@ class Parser:
         while self.at("##"):
             self.i += 1
             lo, hi, hi_inf = self.parse_delay_range()
-            right = self.parse_repeat()
+            if self.at("@"):
+                # s1 ##1 @(clk2) s2 ##1 s3 and s4: clk2 clocks the rest of the
+                # sequence expression, as far as it extends (up to an
+                # implication or the closing parenthesis)
+                cstart = self.tok.pos
+                ev = self.parse_clock_event()
+                right = A.Clocked(ev, _as_seq(self.parse_or()), span=self.span_from(cstart))
+            else:
+                right = self.parse_repeat()
             left = A.SDelay(None if left is None else _as_seq(left), lo, hi, _as_seq(right),
                             hi_inf, span=self.span_from(start))
         return left
@@ -385,10 +402,9 @@ class Parser:
                 inner = A.SMatchItems(_as_seq(inner), self.parse_match_items(),
                                       span=self.span_from(start))
             self.expect(")")
-            if isinstance(inner, A.Node) and A.is_expr(inner):
-                # "(expr)" that the expression parser rejected only because of
-                # what follows; keep it as an expression.
-                return inner
+            if _has_clock(inner):
+                # clocking events do not extend out of the parentheses
+                return A.Clocked(None, inner, span=self.span_from(start))
             return inner
         return self.parse_expr()
 
@@ -560,6 +576,28 @@ def _num_node(t: Token) -> A.Num:
         # unsized based literal: 32-bit, unsigned unless 's
         return A.Num(value, None, signed, xmask, span=span)
     return A.Num(value, width, signed if width is not None else True, xmask, span=span)
+
+
+def _has_clock(node) -> bool:
+    if isinstance(node, A.Clocked):
+        return True
+    if isinstance(node, (A.PSeq, A.SRepeat, A.SFirstMatch, A.SMatchItems)):
+        return _has_clock(node.seq)
+    if isinstance(node, (A.SBin, A.PBin)):
+        return _has_clock(node.left) or _has_clock(node.right)
+    if isinstance(node, A.SDelay):
+        return (node.left is not None and _has_clock(node.left)) or _has_clock(node.right)
+    if isinstance(node, A.SThroughout):
+        return _has_clock(node.seq)
+    if isinstance(node, A.PImpl):
+        return _has_clock(node.seq) or _has_clock(node.prop)
+    if isinstance(node, (A.PNot, A.PUnaryTemporal, A.PAbort)):
+        return _has_clock(node.prop)
+    if isinstance(node, A.PIf):
+        return _has_clock(node.then) or (node.other is not None and _has_clock(node.other))
+    if isinstance(node, A.PCase):
+        return any(_has_clock(p) for _, p in node.items)
+    return False
 
 
 def _as_seq(node: A.Node) -> A.Node:

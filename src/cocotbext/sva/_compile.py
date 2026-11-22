@@ -22,8 +22,8 @@ from ._errors import SvaError, SvaNameError, SvaUnsupportedError
 from ._expr import (HELPERS, Code, ConstRef, ExprCompiler, LocalRef, Resolver, SignalRef,
                     TriggeredRef, mask, walk)
 from ._nfa import Builder
-from ._prop import (FAIL, VPASS, AbortT, AlwaysT, AndT, ConstT, EventuallyT, FollowedByT, IffT, IfT,
-                    ImpliesT, ImplT, NextT, NotT, OrT, SeqT, UntilT)
+from ._prop import (FAIL, VPASS, AbortT, AlignT, AlwaysT, AndT, ConstT, EventuallyT, FollowedByT,
+                    IffT, IfT, ImpliesT, ImplT, NextT, NotT, OrT, SeqT, UntilT)
 
 
 @dataclass
@@ -356,7 +356,7 @@ class Compiler:
                 strong = node.op.startswith("s_")
                 st = "strong" if strong else strength
                 return UntilT(self.prop(node.left, st), self.prop(node.right, st),
-                              node.op.endswith("_with"), strong, env)
+                              node.op.endswith("_with"), strong, env, self._tick(node))
             raise SvaUnsupportedError(self._at(f"'{node.op}' is not supported yet", node))
         if isinstance(node, A.PIf):
             g = self.ctx.guard(node.cond)
@@ -367,6 +367,17 @@ class Compiler:
             if g is False:
                 return q if q is not None else ConstT(VPASS, env)
             return IfT(g, p, q, env)
+        if isinstance(node, A.PAlign):
+            g = self.ctx.guard(node.cond)
+            p = self.prop(node.prop, strength)
+            if g is True:
+                return p
+            if g is False or g[2]:
+                raise SvaError(self._at("unsupported alignment condition", node))
+            return AlignT(g, p)
+        if isinstance(node, A.Clocked):
+            raise SvaUnsupportedError(self._at(
+                "a clocking event inside a property is not supported here", node))
         if isinstance(node, A.PCase):
             return self._case(node, strength)
         if isinstance(node, A.PUnaryTemporal):
@@ -391,9 +402,10 @@ class Compiler:
         # a strong operator makes the default strength of its operand strong
         p = self.prop(node.prop, "strong" if strong else strength)
         env = self.envmode
+        tick = self._tick(node)
         if base == "nexttime":
             n = 1 if node.lo is None else self._count(node.lo)
-            return p if n == 0 else NextT(p, n, strong, env)
+            return p if n == 0 else NextT(p, n, strong, env, tick)
         if node.lo is None:
             if base == "eventually" and not strong:
                 raise SvaError(self._at("'eventually' needs a range: eventually [m:n] (or use s_eventually)", node))
@@ -408,8 +420,19 @@ class Compiler:
             if hi is None and (base == "always") == strong:
                 raise SvaError(self._at(f"'{op}' needs a bounded range", node))
         if base == "always":
-            return AlwaysT(p, lo, hi, strong, env)
-        return EventuallyT(p, lo, hi, strong, env)
+            return AlwaysT(p, lo, hi, strong, env, tick)
+        return EventuallyT(p, lo, hi, strong, env, tick)
+
+    def _tick(self, node):
+        """Guard of the ticks a temporal operator counts (None: every tick)."""
+        if node.tick is None:
+            return None
+        g = self.ctx.guard(node.tick)
+        if g is True:
+            return None
+        if g is False or g[2]:
+            raise SvaError(self._at("unsupported tick condition", node))
+        return g
 
     def _case(self, node: A.PCase, strength):
         default = None

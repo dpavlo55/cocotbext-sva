@@ -170,6 +170,7 @@ class PBin(Node):
     op: str                    # 'and', 'or', 'iff', 'implies', 'until', 's_until', 'until_with', 's_until_with'
     left: Node
     right: Node
+    tick: Optional[Node] = None      # until family: see PUnaryTemporal.tick
 
 
 @dataclass(eq=False)
@@ -199,11 +200,22 @@ class PUnaryTemporal(Node):
     lo: Optional[Node] = None
     hi: Optional[Node] = None
     hi_inf: bool = False
+    # Multi-clock properties (_multiclock): the operator counts only the
+    # ticks at which this expression is true (the ticks of its clock).
+    tick: Optional[Node] = None
 
 
 @dataclass(eq=False)
 class PAbort(Node):
     op: str                    # accept_on, reject_on, sync_accept_on, sync_reject_on
+    cond: Node
+    prop: Node
+
+
+@dataclass(eq=False)
+class PAlign(Node):
+    """prop, evaluated from the first tick at which cond is true (made by
+    _multiclock: a property waiting for the next tick of its clock)."""
     cond: Node
     prop: Node
 
@@ -220,6 +232,18 @@ class ClockEvent(Node):
 
 
 @dataclass(eq=False)
+class Clocked(Node):
+    """`@(event) body` inside a sequence or property: body is clocked by
+    event (multi-clock properties; removed by _multiclock before compiling).
+
+    clock None: a parenthesized group that contains clocking events. They do
+    not extend out of the parentheses: what follows the group is clocked like
+    what precedes it."""
+    clock: Optional[ClockEvent]
+    body: Node
+
+
+@dataclass(eq=False)
 class AssertionSpec(Node):
     clock: Optional[ClockEvent]
     disable: Optional[Node]
@@ -231,6 +255,8 @@ EXPR_NODES = (Num, Id, Index, Slice, PartSelect, Unary, Binary, Cond, Concat, Re
 
 
 def is_seq(node: Node) -> bool:
+    if isinstance(node, Clocked):
+        return is_seq(node.body) or is_expr(node.body)
     return isinstance(node, SEQ_NODES)
 
 

@@ -78,7 +78,7 @@ class Monitor:
                  "_quiet", "last_ev", "idle_v", "_start_bit", "_sink_vac", "tmpl", "_init_term",
                  "_intern", "_gstates", "_ntrans", "tokens", "_envfns", "_actfns", "_allbits",
                  "_fullbits", "_silent", "gs", "meta", "_k", "_kj", "_gs_list", "_gs_ids", "_sym",
-                 "__weakref__")
+                 "_gated", "__weakref__")
 
     def __init__(self, prog, name: str, sink, domain):
         self.prog = prog
@@ -93,6 +93,7 @@ class Monitor:
         # domain's ev) since enabling (_en_ev).
         self._att = 0
         self._en_ev = domain.ev
+        self._gated = False           # attempts are started (and counted) by a GatedStep
         self._sb = prog.start_bit     # start bit while enabled, else 0
         # Quiet ticks: idle ticks whose only effect is on counters (the same
         # outcome as idle_v) are skipped by the domain runner when the inputs
@@ -148,7 +149,7 @@ class Monitor:
     def enabled(self, v: bool):
         self.settle()
         v = bool(v)
-        if v != self._enabled:
+        if v != self._enabled and not self._gated:
             if v:
                 self._en_ev = self.domain.ev
             else:
@@ -161,6 +162,8 @@ class Monitor:
 
     @property
     def n_attempts(self) -> int:
+        if self._gated:
+            return self._att
         return self._att + (self.domain.ev - self._en_ev if self._enabled else 0)
 
     def settle(self):
@@ -438,7 +441,7 @@ class Monitor:
             return
         prog = self.prog
         toks = self.tokens
-        start = self._enabled
+        start = self._sb              # (nonzero while attempts are started)
         if self.qs:
             k = self.domain.ev - self.last_ev - 1
             if k:
@@ -481,7 +484,7 @@ class Monitor:
         """tick_env on (shape id, envs) attempts (see _symenv), given the
         bits of all base atoms."""
         toks = self.tokens
-        start = self._enabled
+        start = self._sb
         if self.qs:
             k = self.domain.ev - self.last_ev - 1
             if k:
@@ -660,6 +663,36 @@ class Monitor:
         else:
             self.gs = self._gstate(())
             self.meta = ()
+
+
+class GatedStep:
+    """Step function of a multi-clock assertion. Its domain ticks whenever
+    one of the assertion's clocks does; attempts start only at ticks of the
+    leading clock (value slot `slot` is nonzero), and those are the attempts
+    counted. With once=True only the first such tick starts an attempt."""
+
+    def __init__(self, mon: "Monitor", slot: int, once: bool = False):
+        self.mon = mon
+        self.slot = slot
+        self.once = once
+        self.inner = mon.tick_env if mon.prog.envmode else mon.tick
+        mon._gated = True
+        mon._att = 0
+
+    def __call__(self, c, R, cx, RX, H, tickno):
+        m = self.mon
+        v = c[self.slot]
+        if v is None:
+            v = c[self.slot] = R[self.slot]()
+        if v and m._enabled:
+            m._sb = m._start_bit
+            m._att += 1
+            self.inner(c, R, cx, RX, H, tickno)
+            if self.once:
+                m.enabled = False
+        else:
+            m._sb = 0
+            self.inner(c, R, cx, RX, H, tickno)
 
 
 class _EnvCtx:

@@ -610,6 +610,48 @@ class IfT(Template):
         return (self.p if term[0] == 0 else self.q).nv(term[1])
 
 
+class AlignT(Template):
+    """P evaluated from the first tick at which a guard holds (multi-clock
+    properties: the next tick of P's clock). Until then the evaluation is
+    unstarted, like the consequent of |=> before its first tick: at the end
+    of the test it only fails if P is a strong obligation."""
+
+    def __init__(self, guard, p: Template):
+        self.guard = guard
+        self.p = p
+        self.envmode = p.envmode
+        self.init_need = guard[0] | guard[1] | p.init_need
+
+    def init(self, env):
+        return ("#W", self.p.init(env))
+
+    def step(self, term, val):
+        if term[0] == "#W":
+            if not guard_true(self.guard, val, None):
+                return None, term
+        t = term[1]
+        v, t2 = self.p.step(t, val)
+        if v is not None:
+            return v, None
+        return None, ("#A", t2)
+
+    def needs(self, term):
+        if term[0] == "#W":
+            return self.init_need
+        return self.p.needs(term[1])
+
+    def finish(self, term):
+        if term[0] == "#W":
+            return self.p.fin0()
+        return self.p.finish(term[1])
+
+    def nv(self, term):
+        return self.p.nv(term[1])
+
+    def fin0(self):
+        return self.p.fin0()
+
+
 class ConstT(Template):
     """Resolves at the first tick with a fixed verdict."""
 
@@ -657,16 +699,23 @@ class NextT(Template):
     next tick. Term: ("N", k, env) while k more ticks are skipped before P
     starts, then ("P", term of P)."""
 
-    def __init__(self, p: Template, n: int, strong: bool, envmode: bool):
+    def __init__(self, p: Template, n: int, strong: bool, envmode: bool, tick=None):
         self.p, self.n, self.strong = p, n, strong
         self.envmode = envmode
-        self.init_need = 0
+        # tick (here and in the operators below): guard of the ticks the
+        # operator counts, for multi-clock properties (None: every tick).
+        # Evaluations of P that are under way advance at every tick.
+        self.tick = tick
+        self.tmask = (tick[0] | tick[1]) if tick else 0
+        self.init_need = self.tmask
 
     def init(self, env):
         return ("N", self.n, env)
 
     def step(self, term, val):
         if term[0] == "N":
+            if self.tick is not None and not guard_true(self.tick, val, None):
+                return None, term
             if term[1] > 0:
                 return None, ("N", term[1] - 1, term[2])
             t = self.p.init(term[2])
@@ -679,7 +728,7 @@ class NextT(Template):
 
     def needs(self, term):
         if term[0] == "N":
-            return self.p.init_need if term[1] == 0 else 0
+            return (self.p.init_need if term[1] == 0 else 0) | self.tmask
         return self.p.needs(term[1])
 
     def finish(self, term):
@@ -701,10 +750,12 @@ class AlwaysT(Template):
     Term: (k, nonvac, instances, env), k = ticks consumed (saturated at lo when
     the range is unbounded, so the term space stays finite)."""
 
-    def __init__(self, p: Template, lo: int, hi, strong: bool, envmode: bool):
+    def __init__(self, p: Template, lo: int, hi, strong: bool, envmode: bool, tick=None):
         self.p, self.lo, self.hi, self.strong = p, lo, hi, strong
         self.envmode = envmode
-        self.init_need = p.init_need if lo == 0 else 0
+        self.tick = tick
+        self.tmask = (tick[0] | tick[1]) if tick else 0
+        self.init_need = (p.init_need if lo == 0 else 0) | self.tmask
 
     def init(self, env):
         return (0, False, _EMPTY, env)
@@ -717,7 +768,8 @@ class AlwaysT(Template):
         p = self.p
         live = set()
         todo = list(insts)
-        if self._in_range(k):
+        tick = self.tick is None or guard_true(self.tick, val, None)
+        if tick and self._in_range(k):
             todo.append(p.init(env))
         for t in todo:
             v, t2 = p.step(t, val)
@@ -727,14 +779,16 @@ class AlwaysT(Template):
                 return v, None
             elif v == PASS:
                 nonvac = True
-        if self.hi is not None and k >= self.hi and not live:
+        if self.hi is not None and not live and (k > self.hi or (tick and k == self.hi)):
             return PASS, None       # reference: never vacuous
-        k2 = k + 1 if (self.hi is not None or k < self.lo) else k
+        k2 = k + 1 if tick and (self.hi is not None or k < self.lo) else k
         return None, (k2, nonvac, frozenset(live), env)
 
     def needs(self, term):
         k, _, insts, _ = term
         m = self.p.init_need if self._in_range(k) else 0
+        if self.hi is None or k <= self.hi:
+            m |= self.tmask
         for t in insts:
             m |= self.p.needs(t)
         return m
@@ -757,10 +811,12 @@ class EventuallyT(Template):
     means $): a new evaluation of P starts at every tick of the range; one
     must hold. Term: (k, instances, env)."""
 
-    def __init__(self, p: Template, lo: int, hi, strong: bool, envmode: bool):
+    def __init__(self, p: Template, lo: int, hi, strong: bool, envmode: bool, tick=None):
         self.p, self.lo, self.hi, self.strong = p, lo, hi, strong
         self.envmode = envmode
-        self.init_need = p.init_need if lo == 0 else 0
+        self.tick = tick
+        self.tmask = (tick[0] | tick[1]) if tick else 0
+        self.init_need = (p.init_need if lo == 0 else 0) | self.tmask
 
     def init(self, env):
         return (0, False, _EMPTY, env)
@@ -772,7 +828,8 @@ class EventuallyT(Template):
         p = self.p
         live = set()
         todo = list(insts)
-        if self._in_range(k):
+        tick = self.tick is None or guard_true(self.tick, val, None)
+        if tick and self._in_range(k):
             todo.append(p.init(env))
         for t in todo:
             v, t2 = p.step(t, val)
@@ -780,14 +837,16 @@ class EventuallyT(Template):
                 live.add(t2)
             elif v == PASS or v == VPASS:
                 return PASS, None   # reference: any success decides, never vacuous
-        if self.hi is not None and k >= self.hi and not live:
+        if self.hi is not None and not live and (k > self.hi or (tick and k == self.hi)):
             return FAIL, None
-        k2 = k + 1 if (self.hi is not None or k < self.lo) else k
+        k2 = k + 1 if tick and (self.hi is not None or k < self.lo) else k
         return None, (k2, vac, frozenset(live), env)
 
     def needs(self, term):
         k, _, insts, _ = term
         m = self.p.init_need if self._in_range(k) else 0
+        if self.hi is None or k <= self.hi:
+            m |= self.tmask
         for t in insts:
             m |= self.p.needs(t)
         return m
@@ -819,10 +878,11 @@ class UntilT(Template):
     j-th tick still relevant (done markers once resolved). `closed`: no more
     ticks are needed (a P failed, or a candidate Q matched)."""
 
-    def __init__(self, p: Template, q: Template, with_: bool, strong: bool, envmode: bool):
+    def __init__(self, p: Template, q: Template, with_: bool, strong: bool, envmode: bool, tick=None):
         self.p, self.q, self.with_, self.strong = p, q, with_, strong
         self.envmode = envmode
-        self.init_need = p.init_need | q.init_need
+        self.tick = tick
+        self.init_need = p.init_need | q.init_need | ((tick[0] | tick[1]) if tick else 0)
 
     def init(self, env):
         return (False, (), False, env)
@@ -838,7 +898,7 @@ class UntilT(Template):
         closed, entries, nonvac, env = term
         p, q = self.p, self.q
         ents = [[_adv(p, pt, val), _adv(q, qt, val)] for pt, qt in entries]
-        if not closed:
+        if not closed and (self.tick is None or guard_true(self.tick, val, None)):
             ents.append([_adv(p, p.init(env), val), _adv(q, q.init(env), val)])
         # a failed P kills every candidate that requires it; no more ticks needed
         for j, (pt, _) in enumerate(ents):

@@ -9,9 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ._compile import Compiler, NamedDef, gen_value_fn
-from ._engine import Monitor, build_runner, make_kernel
+from ._engine import GatedStep, Monitor, build_runner, make_kernel
 from ._expr import ConstRef, SignalRef
 from ._parser import parse_assertion
+from ._errors import SvaError
 from ._prop import FAIL, PASS
 
 
@@ -122,7 +123,8 @@ class TraceRun:
 
     def __init__(self, assertions: dict, signals: dict, params: dict | None = None,
                  named: dict | None = None, kinds: dict | None = None, initial=None, once=(),
-                 sink=None, resolver=None, names=None):
+                 sink=None, resolver=None, names=None, clock: str | None = None,
+                 force_multiclock: bool = False):
         binder = self.binder = TraceBinder(signals, params, resolver, names)
         named_defs = {}
         for n, d in (named or {}).items():
@@ -132,11 +134,17 @@ class TraceRun:
         sink = sink if sink is not None else _Sink(self.result)
         self.dom = _Domain()
         self.mons = []
+        steps = {}
         for name, text in assertions.items():
             spec = parse_assertion(text)
-            prog = Compiler(binder, text, named_defs).compile(spec, (kinds or {}).get(name, "assert"))
+            kind = (kinds or {}).get(name, "assert")
+            spec, lead = _multiclock(spec, text, binder, named_defs, kind, clock, force_multiclock)
+            prog = Compiler(binder, text, named_defs).compile(spec, kind)
             self.result.warnings += prog.warnings
-            self.mons.append(Monitor(prog, name, sink, self.dom))
+            m = Monitor(prog, name, sink, self.dom)
+            self.mons.append(m)
+            if lead is not None:
+                steps[name] = GatedStep(m, binder.lookup((lead,)).slot, name in once)
         self.nslots = len(binder.slot_names)
         self.nx = len(binder.xslot_names)
         row = self.row = {}
@@ -147,8 +155,10 @@ class TraceRun:
         self.initial = initial
         if initial != "first":
             self._prime(initial)
-        self.run = build_runner([(m, m.tick_once if m.name in once else m.tick_env if m.prog.envmode
-                                  else m.tick) for m in self.mons], make_kernel(self.dom))
+        self.run = build_runner([(m, steps[m.name] if m.name in steps
+                                  else m.tick_once if m.name in once
+                                  else m.tick_env if m.prog.envmode else m.tick)
+                                 for m in self.mons], make_kernel(self.dom))
         self.t = 0
 
     @property
@@ -199,15 +209,57 @@ class TraceRun:
 
 def run_trace(assertions: dict, signals: dict, rows: list, params: dict | None = None,
               named: dict | None = None, kinds: dict | None = None, initial: dict | None = None,
-              finish: bool = True, once=()) -> TraceResult:
+              finish: bool = True, once=(), clock: str | None = None,
+              force_multiclock: bool = False) -> TraceResult:
     """Evaluate assertions {name: text} on rows. Ticks are numbered from 0.
 
     Assertions named in `once` start a single attempt at the first tick (SV:
-    a concurrent assertion in an initial block)."""
-    tr = TraceRun(assertions, signals, params, named, kinds, initial, once)
+    a concurrent assertion in an initial block).
+
+    Multi-clock assertions (`@(posedge c1) a ##1 @(posedge c2) b`): a row is a
+    time step in which at least one clock ticks, and the 1-bit signal named
+    like a clock tells whether that clock ticks in it (edges and `iff` of the
+    clocking events are not looked at). `clock` names the default clock of
+    assertions that do not start with a clocking event. With
+    force_multiclock every assertion is evaluated that way, single-clock
+    ones too (rows where their clock does not tick are skipped by the
+    rewritten property instead of being left out of the trace)."""
+    tr = TraceRun(assertions, signals, params, named, kinds, initial, once, clock=clock,
+                  force_multiclock=force_multiclock)
     for r in rows:
         tr.step(r)
     return tr.finish(finish)
+
+
+def _multiclock(spec, text, binder, named, kind, clock, force):
+    """(spec to compile, name of the leading clock or None for a single-clock
+    assertion evaluated on every row)."""
+    from . import _ast as A
+    from ._expr import ExprCompiler
+    from ._multiclock import Rewriter, has_clocks
+
+    def clock_id(ev):
+        if not isinstance(ev.signal, A.Id):
+            raise SvaError("a clock must be a signal name")
+        return ev.signal.name
+
+    default = clock_id(spec.clock) if spec.clock is not None else clock
+    if not force and not has_clocks(spec.prop):
+        return spec, None
+    if default is None:
+        default = "<none>"
+
+    def tick(c):
+        if c == "<none>":
+            raise SvaError("no clock: part of the property has no clocking event")
+        binder.signals.setdefault(c, (1, False))
+        return A.Id((c,))
+
+    rw = Rewriter(clock_id, tick, ExprCompiler(binder, text).const, named, kind, text)
+    # (also when every clocking event names the same clock: the rows are the
+    # time steps of all the clocks of the trace, and this one may not tick in all)
+    prop, lead = rw.rewrite(spec.prop, default)
+    return A.AssertionSpec(spec.clock, spec.disable, prop, span=spec.span), lead
 
 
 def _parse_seq(text):
