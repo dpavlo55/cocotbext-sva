@@ -5,9 +5,19 @@
   </picture>
 </p>
 
-# cocotbext-sva
+<p align="center">
+  <a href="https://cocotbext-sva.readthedocs.io/en/latest/"><img alt="Documentation" src="https://img.shields.io/readthedocs/cocotbext-sva?logo=readthedocs&logoColor=white&label=docs"></a>
+  <a href="https://github.com/dpavlo55/cocotbext-sva/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/dpavlo55/cocotbext-sva/ci.yml?branch=main&logo=github&label=CI"></a>
+  <a href="https://github.com/dpavlo55/cocotbext-sva/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white">
+  <img alt="cocotb 2.x" src="https://img.shields.io/badge/cocotb-2.x-blue">
+</p>
 
-[![Documentation](https://readthedocs.org/projects/cocotbext-sva/badge/?version=latest)](https://cocotbext-sva.readthedocs.io/en/latest/)
+<p align="center">
+  <a href="https://cocotbext-sva.readthedocs.io/en/latest/getting-started.html"><img alt="Getting started" src="https://img.shields.io/badge/%F0%9F%9A%80-Getting%20started-7c6fd6"></a>
+  <a href="https://cocotbext-sva.readthedocs.io/en/latest/guide.html"><img alt="User guide" src="https://img.shields.io/badge/%F0%9F%93%96-User%20guide-7c6fd6"></a>
+  <a href="https://cocotbext-sva.readthedocs.io/en/latest/api.html"><img alt="API reference" src="https://img.shields.io/badge/%F0%9F%A7%A9-API%20reference-7c6fd6"></a>
+</p>
 
 > **Note:** this package was implemented with [Claude Code](https://claude.com/claude-code),
 > and its results were validated against a commercial SVA simulator.
