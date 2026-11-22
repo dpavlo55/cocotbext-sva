@@ -223,9 +223,119 @@ def test_fst_without_kernel_is_a_clear_error(tmp_path, monkeypatch):
         ts.run()
 
 
-def test_clocking_events_are_rejected(tmp_path):
-    from cocotbext.sva import SvaUnsupportedError, TraceSampler
-    ts = TraceSampler(tmp_path / "none.vcd", clock="posedge clk")
-    for text in ("@(posedge clk) a |=> b", "a |=> @(posedge clk2) b"):
-        with pytest.raises(SvaUnsupportedError, match="one clock per TraceSampler"):
-            ts.assert_property(text)
+def write_mc_vcd(path, rows, signals, clocks, scope=("tb", "dut")):
+    """A dump with several clocks: at time step k (10k + 5 ns) the clocks
+    whose flag is set in rows[k] rise (and fall 3 ns later), and the signals
+    change to rows[k + 1] in the same time step: the values sampled at step
+    k are rows[k]."""
+    names = list(clocks) + list(signals)
+    codes = {s: _CODES[i] for i, s in enumerate(names)}
+    out = ["$timescale 1ns $end"] + [f"$scope module {s} $end" for s in scope]
+    for c in clocks:
+        out.append(f"$var wire 1 {codes[c]} {c} $end")
+    for s, w in signals.items():
+        out.append(f"$var wire {w} {codes[s]} {s}{f' [{w - 1}:0]' if w > 1 else ''} $end")
+    out += ["$upscope $end"] * len(scope) + ["$enddefinitions $end"]
+
+    def val(s, row):
+        w, v = signals[s], row.get(s, 0)
+        return f"{v & 1}{codes[s]}" if w == 1 else f"b{v:0{w}b} {codes[s]}"
+
+    out += ["#0", "$dumpvars"] + [f"0{codes[c]}" for c in clocks] + [val(s, rows[0]) for s in signals]
+    out.append("$end")
+    for k, row in enumerate(rows):
+        t = 10 * k + 5
+        out.append(f"#{t}")
+        out += [f"1{codes[c]}" for c in clocks if row[c]]
+        if k + 1 < len(rows):
+            out += [val(s, rows[k + 1]) for s in signals if rows[k + 1].get(s, 0) != row.get(s, 0)]
+        if any(row[c] for c in clocks):
+            out += [f"#{t + 3}"] + [f"0{codes[c]}" for c in clocks if row[c]]
+    path.write_text("\n".join(out) + "\n")
+
+
+def _flat(events, steps):
+    """[(assertion, step of the verdict or -1 at the end, step of a start)]."""
+    out = []
+    for name, tick, starts, at_end in events:
+        out += [(name, -1 if at_end else steps[tick], steps[s]) for s in starts]
+    return sorted(out)
+
+
+def test_multiclock_corpus_through_dumps(tmp_path, monkeypatch):
+    """Every multi-clock corpus case, with a first time step where all
+    clocks tick on zeros, written as a dump with three clocks and checked
+    offline: failures and counters must equal the trace runner's on the
+    same samples (assertions on one clock are then evaluated on that clock's
+    ticks only, multi-clock ones on the ticks of their clocks)."""
+    from cocotbext.sva import _engine
+    from test_corpus_mc import DATA
+    monkeypatch.setattr(_engine, "MAX_STARTS", 1 << 30)
+    signals, clocks = DATA["signals"], DATA["clocks"]
+    zeros = dict({s: 0 for s in signals}, **{c: 1 for c in clocks})
+    checked = 0
+    for case in DATA["cases"]:
+        rows = [zeros] + case["trace"]
+        props, kinds = case["props"], case["kinds"]
+        steps = [k for k, row in enumerate(rows) if any(row[c] for c in clocks)]
+        try:
+            r = run_trace(props, dict(signals, **{c: 1 for c in clocks}), [rows[k] for k in steps],
+                          kinds=kinds, initial=zeros, clock=clocks[0], force_multiclock=True)
+        except SvaError:
+            continue
+        want = _flat([(e.assertion, e.tick, e.starts, e.kind == "end_fail") for e in r.events
+                      if e.kind in ("fail", "end_fail") and kinds[e.assertion] != "cover"], steps)
+        path = tmp_path / f"{case['id']}.vcd"
+        write_mc_vcd(path, rows, signals, clocks)
+        ts = TraceSampler(path, clock=f"posedge {clocks[0]}", scope="tb.dut")
+        for n, text in props.items():
+            (ts.cover_property if kinds[n] == "cover" else ts.assert_property)(text, name=n)
+        res = ts.run()
+        k_of = {10 * k + 5: k for k in range(len(rows))}
+        got = sorted((f.assertion, -1 if f.at_end else k_of[round(f.time_ns)], k_of[round(t)])
+                     for f in res.failures for t in f.start_times_ns)
+        assert got == want, case["id"]
+        for n in props:
+            st = r.stats[n]
+            exp = {"attempts": st["attempts"], "hits": st["passes"]} if kinds[n] == "cover" else st
+            assert res.stats[n] == exp, (case["id"], n)
+        path.unlink()
+        checked += 1
+    assert checked > 300
+
+
+def test_property_clocks_offline(tmp_path):
+    """A clock written in the property selects the clock (edge, iff); the
+    sampler's clock is the default for the parts that have none."""
+    #          k:   0  1  2  3  4  5  6  7
+    clk = [1, 1, 1, 1, 1, 1, 1, 1]
+    clk2 = [0, 1, 0, 0, 1, 0, 1, 0]
+    a = [0, 1, 0, 0, 1, 0, 0, 1]
+    b = [0, 0, 1, 0, 0, 1, 1, 0]
+    en = [1, 1, 1, 1, 0, 1, 1, 1]
+    rows = [{"clk": clk[k], "clk2": clk2[k], "a": a[k], "b": b[k], "en": en[k]} for k in range(8)]
+    path = tmp_path / "w.vcd"
+    write_mc_vcd(path, rows, {"a": 1, "b": 1, "en": 1}, ["clk", "clk2"])
+    ts = TraceSampler(path, clock="posedge clk", scope="tb.dut")
+    ts.assert_property("@(posedge clk2) a", name="on2")              # clk2 ticks at 1, 4, 6
+    ts.assert_property("@(posedge clk2 iff en) a", name="on2_en")    # not at 4 (en = 0)
+    ts.assert_property("@(negedge clk2) !b", name="neg2")            # at 18, 48, 68 ns: rows 2, 5, 7
+    ts.assert_property("a |=> @(posedge clk2) b", name="mc")         # a at 1 -> clk2 at 4: b = 0
+    ts.assert_property("@(posedge clk) a |=> @(posedge clk) b", name="same")   # one clock, holds
+    ts.cover_property("@(posedge clk2) a ##1 @(posedge clk) b", name="cov")
+    res = ts.run()
+    fails = sorted((f.assertion, f.time_ns, tuple(f.start_times_ns)) for f in res.failures)
+    assert fails == [("mc", 45.0, (15.0,)), ("neg2", 18.0, (18.0,)), ("neg2", 48.0, (48.0,)),
+                     ("on2", 65.0, (65.0,)), ("on2_en", 65.0, (65.0,))], fails
+    assert res.stats["on2"]["attempts"] == 3 and res.stats["on2_en"]["attempts"] == 2
+    assert res.stats["neg2"]["attempts"] == 3 and res.stats["same"]["passes"] == 2
+    assert res.stats["mc"]["attempts"] == 8 and res.stats["mc"]["vacuous"] == 5
+    assert res.stats["cov"] == {"attempts": 3, "hits": 2}
+    assert res.cycles == 8 + 3              # clk at every step, plus the falling edges of clk2
+    early = ts.run(until_ns=40)             # time steps up to 40 ns only
+    assert [(f.assertion, f.time_ns) for f in early.failures] == [("neg2", 18.0)]
+    assert early.cycles == 4 + 1 and early.stats["mc"]["attempts"] == 4
+    with pytest.raises(SvaError, match="clock 'nope' not found"):
+        bad = TraceSampler(path, clock="posedge clk", scope="tb.dut")
+        bad.assert_property("a |=> @(posedge nope) b")
+        bad.run()

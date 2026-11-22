@@ -133,7 +133,10 @@ class TraceRun:
     def __init__(self, assertions: dict, signals: dict, params: dict | None = None,
                  named: dict | None = None, kinds: dict | None = None, initial=None, once=(),
                  sink=None, resolver=None, names=None, clock: str | None = None,
-                 force_multiclock: bool = False):
+                 force_multiclock: bool = False, specs: dict | None = None, clock_id=None):
+        # specs: name -> parsed AssertionSpec (else parsed from the text);
+        # clock_id(ClockEvent) -> name of the 1-bit row signal telling whether
+        # that clock ticks (default: the clock's own signal name)
         binder = self.binder = TraceBinder(signals, params, resolver, names)
         named_defs = {}
         for n, d in (named or {}).items():
@@ -145,9 +148,10 @@ class TraceRun:
         self.mons = []
         steps = {}
         for name, text in assertions.items():
-            spec = parse_assertion(text)
+            spec = (specs or {}).get(name) or parse_assertion(text)
             kind = (kinds or {}).get(name, "assert")
-            spec, lead = _multiclock(spec, text, binder, named_defs, kind, clock, force_multiclock)
+            spec, lead = _multiclock(spec, text, binder, named_defs, kind, clock, force_multiclock,
+                                     clock_id)
             prog = Compiler(binder, text, named_defs).compile(spec, kind)
             self.result.warnings += prog.warnings
             m = Monitor(prog, name, sink, self.dom)
@@ -246,17 +250,18 @@ def run_trace(assertions: dict, signals: dict, rows: list, params: dict | None =
     return tr.finish(finish)
 
 
-def _multiclock(spec, text, binder, named, kind, clock, force):
-    """(spec to compile, name of the leading clock or None for a single-clock
-    assertion evaluated on every row)."""
+def _multiclock(spec, text, binder, named, kind, clock, force, clock_id=None):
+    """(spec to compile, name of the leading clock's tick signal or None for
+    a single-clock assertion evaluated on every row)."""
     from . import _ast as A
     from ._expr import ExprCompiler
     from ._multiclock import Rewriter, uses_clocks
 
-    def clock_id(ev):
-        if not isinstance(ev.signal, A.Id):
-            raise SvaError("a clock must be a signal name")
-        return ev.signal.name
+    if clock_id is None:
+        def clock_id(ev):
+            if not isinstance(ev.signal, A.Id):
+                raise SvaError("a clock must be a signal name")
+            return ev.signal.name
 
     default = clock_id(spec.clock) if spec.clock is not None else clock
     if not force and not uses_clocks(spec.prop, named):

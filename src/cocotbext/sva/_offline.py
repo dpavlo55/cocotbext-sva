@@ -254,12 +254,29 @@ class _Sink:
     wants_pass = False
     wants_vacuous = False
 
-    def __init__(self, checker):
+    def __init__(self, checker, group):
         self.checker = checker
+        self.group = group
 
     def __call__(self, verdict, mon, count, starts, tickno, at_end=False):
         if verdict == FAIL:
-            self.checker._failure(mon.name, count, starts, tickno, at_end)
+            self.checker._failure(self.group, mon.name, count, starts, tickno, at_end)
+
+
+class _Group:
+    """Assertions evaluated on one set of clocks: one clock (ticks: None), or
+    the clocks of multi-clock assertions (a tick at every time step in which
+    one of them ticks; ticks[i] names the row signal telling whether clock i
+    does)."""
+
+    def __init__(self, clocks, ticks):
+        self.clocks = clocks
+        self.ticks = ticks
+        self.props: dict = {}
+        self.kinds: dict = {}
+        self.specs: dict = {}
+        self.run = None
+        self.times = array("q")
 
 
 class TraceSampler:
@@ -271,13 +288,17 @@ class TraceSampler:
                           disable_iff="!rst_n")
         ts.assert_property("req |-> ##[1:3] ack", name="req_ack")
         ts.cover_property("req ##1 req")
+        ts.assert_property("req |=> @(posedge clk_b) ##[1:4] ack_b")   # multi-clock
         result = ts.run()          # result.ok, result.failures, result.summary()
 
     Names in properties are resolved under `scope` (dot-separated, as in the
-    dump; case-insensitive fallback). One clock per sampler; a clock written
-    in a property text is ignored. Immediate assertions, local-variable-free
-    and local-variable properties, sampled-value functions and $isunknown
-    (x/z in the dump) are supported; real-valued signals are not.
+    dump; case-insensitive fallback). `clock` is the default clock; a
+    property may name its own clocks (`@(negedge clk) ...`, `@(posedge c iff
+    en)`), several of them too (multi-clock properties: as online, one tick
+    per time step in which one of its clocks ticks). Immediate assertions,
+    local-variable-free and local-variable properties, sampled-value
+    functions and $isunknown (x/z in the dump) are supported; real-valued
+    signals are not.
     """
 
     def __init__(self, path, clock: str, *, scope: str = "", disable_iff: str | None = None,
@@ -300,13 +321,8 @@ class TraceSampler:
         if name in self.props:
             raise SvaError(f"duplicate assertion name {name!r}")
         text = str(getattr(prop, "text", prop))
-        from ._multiclock import has_clocks
         from ._parser import parse_assertion
-        spec = parse_assertion(text)
-        if spec.clock is not None or has_clocks(spec.prop):
-            raise SvaUnsupportedError(
-                f"{name}: clocking events in the property are not supported offline "
-                f"(one clock per TraceSampler: {self.clock_name})")
+        parse_assertion(text)                       # syntax errors now
         if self.disable_iff and kind != "cover" and "disable iff" not in text:
             text = f"disable iff ({self.disable_iff}) {text}"
         self.props[name] = text
@@ -325,21 +341,30 @@ class TraceSampler:
     def _full(self, name):
         return f"{self.scope}.{name}" if self.scope else name
 
-    def run(self) -> OfflineResult:
+    def run(self, until_ns: float | None = None) -> OfflineResult:
+        """Check the dump; with until_ns, only its time steps up to that time
+        (e.g. the end of the test, when the simulator dumped beyond it)."""
         dump = open_dump(self.path)
         try:
-            return self._run(dump)
+            return self._run(dump, until_ns)
         finally:
             dump.close()
 
-    def _run(self, vcd: _Dump) -> OfflineResult:
-        clk = vcd.find(self._full(self.clock_name)) or vcd.find(self.clock_name)
-        if clk is None:
-            raise SvaError(f"clock {self.clock_name!r} not found in {self.path} (scope {self.scope!r})")
+    def _run(self, vcd: _Dump, until_ns=None) -> OfflineResult:
+        from . import _ast as A
+        from ._compile import _Ctx, gen_value_fn
+        from ._expr import ExprCompiler
+        from ._multiclock import Rewriter, strip_clocks, uses_clocks
+        from ._parser import parse_assertion
+        from ._trace import TraceBinder
+
         resolved = {}
 
+        def find(name):
+            return vcd.find(self._full(name)) or vcd.find(name)
+
         def resolver(name):
-            hit = vcd.find(self._full(name)) or vcd.find(name)
+            hit = find(name)
             if hit is None:
                 return None
             resolved[name] = hit
@@ -349,48 +374,153 @@ class TraceSampler:
             pre = self.scope + "." if self.scope else ""
             return [n[len(pre):] for n in vcd.vars if n.startswith(pre)]
 
+        # clocks: key (id code, edge, iff text) -> (id code, edge, iff node)
+        clocks: dict = {}
+
+        def clock_key(name, edge, iff=None):
+            hit = find(name)
+            if hit is None:
+                raise SvaError(f"clock {name!r} not found in {self.path} (scope {self.scope!r})")
+            if type(hit[0]) is tuple:
+                raise SvaError(f"clock {name!r} is a vector in {self.path}")
+            key = (hit[0], edge, None if iff is None else repr(iff))
+            clocks.setdefault(key, (hit[0], edge, iff))
+            return key
+
+        def event_key(ev):
+            if not isinstance(ev.signal, A.Id):
+                raise SvaError("a clock must be a signal name")
+            return clock_key(ev.signal.name, ev.edge or "edge", ev.iff)
+
+        default = clock_key(self.clock_name, self.edge)
+
+        # group the assertions by the clocks they use
+        groups: dict = {}
+        for name, text in self.props.items():
+            spec = parse_assertion(text)
+            kind = self.kinds[name]
+            first = event_key(spec.clock) if spec.clock is not None else default
+            if uses_clocks(spec.prop, {}):
+                const = ExprCompiler(TraceBinder({}, self.params, resolver, names), text).const
+                _, used = Rewriter(event_key, None, const, {}, kind, text).analyse(spec.prop, first)
+                if len(used) == 1:                  # every clocking event names one clock
+                    spec = A.AssertionSpec(None, spec.disable, strip_clocks(spec.prop), span=spec.span)
+                    gkey = tuple(used)
+                else:
+                    gkey = tuple(sorted(used, key=repr))
+            else:
+                gkey = (first,)
+            g = groups.get(gkey)
+            if g is None:
+                k = len(groups)
+                g = groups[gkey] = _Group(list(gkey), None if len(gkey) == 1
+                                          else [f"$tick{k}_{i}" for i in range(len(gkey))])
+            g.props[name], g.kinds[name], g.specs[name] = text, kind, spec
+
         self.result = OfflineResult()
-        self._times = array("q")
         self._unit = vcd.ns_per_unit
-        tr = TraceRun(self.props, {}, self.params, kinds=self.kinds, initial="first",
-                      sink=_Sink(self), resolver=resolver, names=names)
-        self.result.warnings = list(tr.result.warnings)
-        vals, xnames = tr.signal_names
-        xset = set(xnames)
+        tick_names = set()
+        vals, xset = [], set()
+        for g in groups.values():
+            clock_id = clock = None
+            if g.ticks is not None:
+                tick_of = dict(zip(g.clocks, g.ticks))
+                tick_names |= set(g.ticks)
+
+                def clock_id(ev, _t=tick_of):
+                    return _t[event_key(ev)]
+                clock = tick_of.get(default)
+            g.run = TraceRun(g.props, {}, self.params, kinds=g.kinds, initial="first",
+                             sink=_Sink(self, g), resolver=resolver, names=names, clock=clock,
+                             specs=g.specs, clock_id=clock_id)
+            self.result.warnings += g.run.result.warnings
+            v, x = g.run.signal_names
+            vals += v
+            xset |= set(x)
+
+        # iff conditions of clocking events, on the sampled values
+        cur = {}                                    # row of current (sampled) values
+        iff_fns = {}
+        for key, (_, _, iff) in clocks.items():
+            if iff is None:
+                continue
+            b = TraceBinder({}, self.params, resolver, names)
+            fn = gen_value_fn(ExprCompiler(_Ctx(b, key[2], {}, set()), key[2]).boolean(iff))
+            R = [(lambda n=n: cur.get(n, 0)) for n in b.slot_names]
+            RX = [(lambda n=n: cur.get((n, "x"), 0)) for n in b.xslot_names]
+            iff_fns[key] = (fn, R, RX, len(b.slot_names), len(b.xslot_names), len(b.channels))
+            vals += b.slot_names
+            xset |= set(b.xslot_names)
+
         by_code: dict = {}                          # id code -> [(name, width, bit or None)]
-        for name in vals:
+        for name in dict.fromkeys(vals):
+            if name in tick_names:
+                continue
             code, width = resolved[name]
             if type(code) is tuple:                 # vector dumped bit by bit
                 for c, bit in code:
                     by_code.setdefault(c, []).append((name, width, bit))
             else:
                 by_code.setdefault(code, []).append((name, width, None))
-        clk_code = clk[0]
-        wanted = set(by_code) | {clk_code}
-        cur = {}                                    # row of current values
-        for name in vals:
             cur[name] = 0
             if name in xset:
                 cur[(name, "x")] = 0
-        clk_val = [None]                            # no value yet: the first one is not an edge
-        edge = self.edge
-        times, step = self._times, tr.step
+        clk_val = dict.fromkeys(c for c, _, _ in clocks.values())   # None: no value yet
+        wanted = set(by_code) | set(clk_val)
+        plan = [(key, code, edge, iff_fns.get(key)) for key, (code, edge, _) in clocks.items()]
+        glist = [(g.run.step, g.times, g.clocks[0] if g.ticks is None else None,
+                  None if g.ticks is None else list(zip(g.clocks, g.ticks)))
+                 for g in groups.values()]
+        cycles = [0]
+        last = None if until_ns is None else until_ns / vcd.ns_per_unit + 0.5   # (dump time units)
 
         def on_step(time, changes):
-            old = clk_val[0]
-            new_clk = old
+            if last is not None and time > last:
+                return
+            edges = None
             for code, v in changes:
-                if code == clk_code:
-                    new_clk = v[-1] if len(v) > 1 else v
-            if old is None:
-                clk_val[0] = new_clk
-            elif new_clk != old:
-                rose = (old == "0" and new_clk != "0") or (old in "xz" and new_clk == "1")
-                fell = (old == "1" and new_clk != "1") or (old in "xz" and new_clk == "0")
-                if (edge == "posedge" and rose) or (edge == "negedge" and fell) or                         (edge == "edge" and (rose or fell)):
+                if code in clk_val:
+                    new = v[-1] if len(v) > 1 else v
+                    old = clk_val[code]
+                    clk_val[code] = new
+                    if old is not None and new != old:    # (the first value is not an edge)
+                        rose = (old == "0" and new != "0") or (old in "xz" and new == "1")
+                        fell = (old == "1" and new != "1") or (old in "xz" and new == "0")
+                        if edges is None:
+                            edges = {}
+                        edges[code] = (rose, fell)
+            if edges is not None:
+                ticked = set()
+                for key, code, edge, iff in plan:
+                    e = edges.get(code)
+                    if e is None:
+                        continue
+                    if e[0] if edge == "posedge" else e[1] if edge == "negedge" else e[0] or e[1]:
+                        if iff is not None:
+                            fn, R, RX, n, nx, nh = iff
+                            if not fn([None] * n, R, [None] * nx, RX, [None] * nh):
+                                continue
+                        ticked.add(key)
+                stepped = False
+                for step, times, single, ticks in glist:
+                    if single is not None:
+                        if single not in ticked:
+                            continue
+                    else:
+                        hit = False
+                        for key, tn in ticks:
+                            if key in ticked:
+                                cur[tn] = 1
+                                hit = True
+                            else:
+                                cur[tn] = 0
+                        if not hit:
+                            continue
                     times.append(time)
                     step(cur)                       # values before this time step
-                clk_val[0] = new_clk
+                    stepped = True
+                if stepped:
+                    cycles[0] += 1
             for code, v in changes:
                 for name, width, bit in by_code.get(code, ()):
                     if bit is None:
@@ -405,16 +535,19 @@ class TraceSampler:
                         cur[(name, "x")] = xm
 
         vcd.stream(wanted, on_step)
-        res = tr.finish()
-        self.result.cycles = len(self._times)
-        for name, st in res.stats.items():
+        stats = {}
+        for g in groups.values():
+            stats.update(g.run.finish().stats)
+        self.result.cycles = cycles[0]
+        for name in self.props:
+            st = stats[name]
             if self.kinds[name] == "cover":
                 st = {"attempts": st["attempts"], "hits": st["passes"]}
             self.result.stats[name] = st
         return self.result
 
-    def _failure(self, name, count, starts, tickno, at_end):
-        times, unit = self._times, self._unit
+    def _failure(self, group, name, count, starts, tickno, at_end):
+        times, unit = group.times, self._unit
 
         def at(tick):
             return times[min(tick, len(times) - 1)] * unit if times else 0.0

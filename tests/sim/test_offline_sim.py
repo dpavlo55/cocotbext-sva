@@ -7,6 +7,7 @@ import random
 
 import cocotb
 from cocotb.clock import Clock
+from cocotb.simtime import get_sim_time
 from cocotb.triggers import FallingEdge
 
 from cocotbext.sva import Assertions, posedge
@@ -61,6 +62,7 @@ async def test_online_with_dump(dut):
         "failures": sorted([f.name.split(".", 1)[1], f.time, list(f.start_times), f.count, f.at_end]
                            for f in errors),
         "stats": {k.split(".", 1)[1]: v for k, v in a.stats().items()},
+        "end": get_sim_time("ns"),
     }
     with open(os.environ["OFFLINE_RESULT"], "w") as fh:
         json.dump(out, fh)
