@@ -68,8 +68,14 @@ def bench(session):
     out = "benchmarks/results.jsonl"
     if os.path.exists(out):
         os.remove(out)
+    out_probe = "benchmarks/results_probe.jsonl"
+    if os.path.exists(out_probe):
+        os.remove(out_probe)
     _run_everywhere(session, "benchmarks/run.py")
     session.run(sys.executable, "benchmarks/report.py", external=True)
+    # the generated HDL probe (Probe) against sampling at the clock edge
+    _run_everywhere(session, "benchmarks/run_probe.py")
+    session.run(sys.executable, "benchmarks/report.py", "results_probe.jsonl", external=True)
 
 
 @nox.session(python=False)
@@ -98,6 +104,7 @@ def simtests(session):
     a dump each simulator writes (must equal the online results)."""
     _run_everywhere(session, "tests/sim/run.py")
     _run_everywhere(session, "tests/sim/run_clocks.py")
+    _run_everywhere(session, "tests/sim/run_probe.py")
     _run_everywhere(session, "tests/sim/run_offline.py")
 
 
